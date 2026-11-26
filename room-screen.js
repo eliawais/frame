@@ -1,12 +1,15 @@
 'use strict';
 
 class RoomScreenLink {
-  constructor(connection, signal, onChange) {
+  constructor(connection, signal, onChange, voiceEnabled) {
     this.connection = connection;
     this.pc = connection.peerConnection;
     this.signal = signal;
     this.onChange = onChange;
     this.received = new MediaStream();
+    this.voice = new MediaStream();
+    this.voiceEnabled = voiceEnabled;
+    this.voiceTrack = null;
     this.transceivers = [];
     this.work = Promise.resolve();
     this.ready = false;
@@ -15,12 +18,14 @@ class RoomScreenLink {
     this.pending = '';
     this.source = null;
     this.packetTimer = null;
-    this.handleTrack = ({track}) => {
+    this.handleTrack = ({track, transceiver}) => {
       if (this.closed || !['video', 'audio'].includes(track.kind)) return;
-      for (const previous of this.received.getTracks()) {
-        if (previous.kind === track.kind && previous !== track) this.received.removeTrack(previous);
+      const index = this.pc.getTransceivers().indexOf(transceiver);
+      const destination = this.voiceEnabled && index === 2 ? this.voice : this.received;
+      for (const previous of destination.getTracks()) {
+        if (previous.kind === track.kind && previous !== track) destination.removeTrack(previous);
       }
-      if (!this.received.getTracks().includes(track)) this.received.addTrack(track);
+      if (!destination.getTracks().includes(track)) destination.addTrack(track);
       const changed = () => this.onChange();
       for (const event of ['unmute', 'mute', 'ended']) track.addEventListener(event, changed);
       this.onChange();
@@ -31,6 +36,10 @@ class RoomScreenLink {
 
   get playable() {
     return this.ready && this.received.getVideoTracks().some(track => track.readyState === 'live' && !track.muted);
+  }
+
+  get voicePlayable() {
+    return this.ready && this.voice.getAudioTracks().some(track => track.readyState === 'live' && !track.muted);
   }
 
   get sending() {
@@ -70,7 +79,8 @@ class RoomScreenLink {
     this.pending = token;
     this.enqueue(async () => {
       if (this.pc.signalingState !== 'stable') throw Error('Room connection is busy');
-      this.transceivers = ['video', 'audio'].map(kind => this.pc.addTransceiver(kind, {direction: 'sendrecv'}));
+      const kinds = this.voiceEnabled ? ['video', 'audio', 'audio'] : ['video', 'audio'];
+      this.transceivers = kinds.map(kind => this.pc.addTransceiver(kind, {direction: 'sendrecv'}));
       await this.pc.setLocalDescription(await this.pc.createOffer());
       this.packetTimer = setTimeout(() => this.enqueue(() => this.fail()), 12000);
       this.signal({type: 'roomScreenOffer', token, sdp: this.pc.localDescription.sdp});
@@ -85,6 +95,10 @@ class RoomScreenLink {
       await this.pc.setRemoteDescription({type: 'offer', sdp: message.sdp});
       this.transceivers = this.pc.getTransceivers().filter(({receiver}) =>
         ['video', 'audio'].includes(receiver.track.kind));
+      const expected = this.voiceEnabled ? 'video,audio,audio' : 'video,audio';
+      if (this.transceivers.map(slot => slot.receiver.track.kind).join(',') !== expected) {
+        throw Error('Unexpected room media tracks');
+      }
       for (const slot of this.transceivers) slot.direction = 'sendrecv';
       await this.pc.setLocalDescription(await this.pc.createAnswer());
       this.signal({type: 'roomScreenAnswer', token: message.token, sdp: this.pc.localDescription.sdp});
@@ -108,8 +122,9 @@ class RoomScreenLink {
     });
   }
 
-  setSource(stream) {
+  setSource(stream, voiceTrack) {
     this.source = stream;
+    this.voiceTrack = voiceTrack;
     if (this.ready && !this.updating) {
       this.updating = true;
       this.enqueue(async () => {
@@ -122,8 +137,9 @@ class RoomScreenLink {
   async updateSenders() {
     const tracks = this.source?.getTracks() || [];
     // Attach screen tracks to negotiated senders without creating a new ICE connection.
-    await Promise.all(this.transceivers.map(({sender, receiver}) => {
-      const track = tracks.find(item => item.kind === receiver.track.kind && item.readyState === 'live') || null;
+    await Promise.all(this.transceivers.map(({sender, receiver}, index) => {
+      const track = index === 2 ? this.voiceTrack :
+        (tracks.find(item => item.kind === receiver.track.kind && item.readyState === 'live') || null);
       return track === sender.track ? undefined : sender.replaceTrack(track);
     }));
   }

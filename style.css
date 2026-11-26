@@ -19,3 +19,9 @@
 .source-tools span { flex:1 1 180px; color:var(--muted); }
 .source-tools a { padding:7px 2px; color:var(--text); text-underline-offset:3px; }
 .source-tools button { padding:7px 10px; font-size:12px; }
+
+.seek-controls {display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:8px 10px;margin:8px 0;color:var(--muted);font-size:12px}
+.seek-controls input {flex:1 1 100px;min-width:0;padding:0;accent-color:#b6df57;cursor:pointer}
+.seek-controls output {font-variant-numeric:tabular-nums}
+#micMeter {display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:11px}
+#micLevel {width:52px}

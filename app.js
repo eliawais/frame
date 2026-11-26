@@ -1,6 +1,6 @@
 'use strict';
 const $=id=>document.getElementById(id), ui={landing:$('landing'),room:$('room'),status:$('status'),notice:$('notice'),movie:$('movie'),screen:$('screenVideo')};
-const MAX=6, prefix='frame-v1-', tokenRE=/^(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;let permissions={playback:false,browse:false},browserState='',browserSelected=false,activeShareKind='screen';let peer,roomKey='',roomSlug='',me='',name='',host=false,up=null,roster=new Map(),clients=new Map(),out=new Map(),incoming=new Map(),streams=new Map(),volumes=new Map(),localAV=new MediaStream(),localScreen=null,activeScreen='',movieState=null,applying=false,applyTimer,toastTimer,localURL='',localPlayback=false,pendingLocal=false,joined=false,leaving=false;
+const MAX=6, prefix='frame-v1-', tokenRE=/^(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;let permissions={playback:false,browse:false,seek:false},browserState='',browserSelected=false,activeShareKind='screen';let peer,roomKey='',roomSlug='',me='',name='',host=false,up=null,roster=new Map(),clients=new Map(),out=new Map(),incoming=new Map(),streams=new Map(),volumes=new Map(),localAV=new MediaStream(),localScreen=null,activeScreen='',movieState=null,applying=false,applyTimer,toastTimer,localURL='',localPlayback=false,pendingLocal=false,joined=false,leaving=false;
 let voiceMode=false,voiceContext=null,voiceInput=null,voiceProcessor=null,voiceSilent=null,voiceTrack=null,voiceNeedsTap=false;const voiceQueue = new Map(), voiceGains = new Map(), voiceSources = new Map();
 const voiceRate = new Map(), voiceLast = new Map(), voiceRequestAt = new Map();
 const voiceMissingSince = new Map(), voiceBackup = new Set(), voiceWarmUntil = new Map();
@@ -117,17 +117,18 @@ function theme(t){document.documentElement.dataset.theme=t;try{localStorage.setI
 const initial=parseInvite(location.hash||new URL(location.href).searchParams.get('room')||'');if(tokenRE.test(initial.key))$('roomInput').value=(initial.slug?initial.slug+'.':'')+initial.key;function startLabel(){const joining=!!$('roomInput').value.trim();$('start').firstChild.textContent=joining?'Join room ':'Create room ';$('roomNameWrap').hidden=joining;}$('roomInput').oninput=startLabel;startLabel();
 function send(c,m){if(c?.open)try{c.send(m);}catch{}}function broadcast(m){for(const c of clients.values())send(c,m);}function toHost(m){if(host)handleHost(me,m);else send(up,m);}
 function enter(){joined=true;ui.landing.hidden=true;ui.room.hidden=false;status('Connected');networkText(networkLabel(activeNetwork));history.replaceState(null,'',inviteLink());$('roomTitle').textContent=roomTitle();renderPeople();$('mediaRetry').hidden=false;$('voiceCompat').hidden=!host;startNetworkWatch();updateVoiceStatus();$('mediaURL').disabled=!host;$('loadMovie').disabled=!host;$('permissionsToggle').hidden=!host;refreshAccess();if(!host)ui.notice.textContent='The host manages guest permissions. Calls and screen sharing remain available.';}
-$('joinForm').onsubmit=e=>{e.preventDefault();if(peer)return;const requested=parseRoom($('roomInput').value);if($('roomInput').value.trim()&&!tokenRE.test(requested)){toast('Invalid room link or code.');return;}if(!window.Peer){toast('Signaling library unavailable. Check your internet and reload.');return;}if(!window.isSecureContext){toast('Open Frame over HTTPS or localhost.');return;}enableSound();name=safeName($('nickname').value);try{localStorage.setItem('frame-name',name);}catch{}host=!requested;roomKey=requested||newRoomCode();roomSlug=host?slugify($('roomName').value):parseInvite($('roomInput').value).slug;status('Connecting…');$('start').disabled=true;peer=new Peer(host?prefix+roomKey:prefix+id(),{debug:0,config:iceConfig()});const timeout=setTimeout(()=>{if(!joined)fail('Connection timed out. Check the room link and Network settings; a TURN relay may be required.');},30000);peer.on('open',p=>{me=p;if(host){roster.set(me,{id:me,name});clearTimeout(timeout);enter();}else{up=peer.connect(prefix+roomKey,{reliable:true,serialization:'json',metadata:{room:roomKey}});up.on('open',()=>send(up,{type:'hello',name,roomScreen:true}));up.on('data',m=>{if(m?.type==='welcome'){if(m.roomScreen===true)roomScreenSupport.add(up);clearTimeout(timeout);applyRoster(m.roster);enter();applyShared(m.shared,m.shareKind);applyPermissions(m.permissions);setVoiceMode(m.voiceMode===true);if(m.movie)applyMovie(m.movie);if(m.browser)applyBrowser(m.browser);}else if(m?.type==='reject'){clearTimeout(timeout);fail(String(m.reason||'Room unavailable'));}else if(joined)handleGuest(m);});up.on('close',()=>{if(!leaving){status('Host disconnected');stopVoiceCapture();clearVoicePlayback();if(activeScreen===up.peer)applyShared('');refreshAccess();notice('The host left or the connection was lost. Rejoin using the invite link.');updateVoiceStatus();}});up.on('error',()=>{if(!joined)fail('Could not connect to host. Try Network settings or a dedicated TURN relay.');});}});peer.on('connection',c=>{if(!host||c.metadata?.room!==roomKey){c.close();return;}let accepted=false;const timer=setTimeout(()=>{if(!accepted)c.close();},10000);c.on('data',m=>{if(!accepted){if(m?.type!=='hello')return;if(roster.size>=MAX||clients.has(c.peer)){send(c,{type:'reject',reason:'Room is full or already connected.'});setTimeout(()=>c.close(),500);return;}accepted=true;clearTimeout(timer);if(m.roomScreen===true)roomScreenSupport.add(c);clients.set(c.peer,c);roster.set(c.peer,{id:c.peer,name:safeName(m.name)});send(c,{type:'welcome',roster:[...roster.values()],shared:activeScreen,shareKind:activeShareKind,movie:currentMovie(),permissions,browser:browserState,voiceMode,roomScreen:true});publishRoster();return;}handleHost(c.peer,m);});c.on('close',()=>{clearTimeout(timer);if(accepted&&clients.get(c.peer)===c){clients.delete(c.peer);roster.delete(c.peer);removeVoiceParticipant(c.peer);if(activeScreen===c.peer)setShared('');publishRoster();}});c.on('error',()=>c.close());});peer.on('call',acceptCall);peer.on('disconnected',()=>{status('Signaling interrupted');if(!leaving&&!peer.destroyed)try{peer.reconnect();}catch{}});peer.on('error',e=>{if(!joined){clearTimeout(timeout);fail(e.type==='peer-unavailable'?'Room not found. Ask the host to keep it open.':'Connection failed: '+(e.type||'unknown'));}else notice('Connection issue: '+(e.type||'unknown')+'. Some media may not connect.');});};
+$('joinForm').onsubmit=e=>{e.preventDefault();if(peer)return;const requested=parseRoom($('roomInput').value);if($('roomInput').value.trim()&&!tokenRE.test(requested)){toast('Invalid room link or code.');return;}if(!window.Peer){toast('Signaling library unavailable. Check your internet and reload.');return;}if(!window.isSecureContext){toast('Open Frame over HTTPS or localhost.');return;}enableSound();name=safeName($('nickname').value);try{localStorage.setItem('frame-name',name);}catch{}host=!requested;roomKey=requested||newRoomCode();roomSlug=host?slugify($('roomName').value):parseInvite($('roomInput').value).slug;status('Connecting…');$('start').disabled=true;peer=new Peer(host?prefix+roomKey:prefix+id(),{debug:0,config:iceConfig()});const timeout=setTimeout(()=>{if(!joined)fail('Connection timed out. Check the room link and Network settings; a TURN relay may be required.');},30000);peer.on('open',p=>{me=p;if(host){roster.set(me,{id:me,name});clearTimeout(timeout);enter();}else{up=peer.connect(prefix+roomKey,{reliable:true,serialization:'json',metadata:{room:roomKey}});up.on('open',()=>send(up,{type:'hello',name,roomScreen:true,roomVoice:true}));up.on('data',m=>{if(m?.type==='welcome'){if(m.roomScreen===true)roomScreenSupport.add(up);if(m.roomVoice===true)roomVoiceSupport.add(up);clearTimeout(timeout);applyRoster(m.roster);enter();applyShared(m.shared,m.shareKind);applyLocalTimeline(m.timeline);applyPermissions(m.permissions);setVoiceMode(m.voiceMode===true);if(m.movie)applyMovie(m.movie);if(m.browser)applyBrowser(m.browser);}else if(m?.type==='reject'){clearTimeout(timeout);fail(String(m.reason||'Room unavailable'));}else if(joined)handleGuest(m);});up.on('close',()=>{if(!leaving){status('Host disconnected');stopVoiceCapture();clearVoicePlayback();if(activeScreen===up.peer)applyShared('');refreshAccess();notice('The host left or the connection was lost. Rejoin using the invite link.');updateVoiceStatus();}});up.on('error',()=>{if(!joined)fail('Could not connect to host. Try Network settings or a dedicated TURN relay.');});}});peer.on('connection',c=>{if(!host||c.metadata?.room!==roomKey){c.close();return;}let accepted=false;const timer=setTimeout(()=>{if(!accepted)c.close();},10000);c.on('data',m=>{if(!accepted){if(m?.type!=='hello')return;if(roster.size>=MAX||clients.has(c.peer)){send(c,{type:'reject',reason:'Room is full or already connected.'});setTimeout(()=>c.close(),500);return;}accepted=true;clearTimeout(timer);if(m.roomScreen===true)roomScreenSupport.add(c);if(m.roomVoice===true)roomVoiceSupport.add(c);clients.set(c.peer,c);roster.set(c.peer,{id:c.peer,name:safeName(m.name)});send(c,{type:'welcome',roster:[...roster.values()],shared:activeScreen,shareKind:activeShareKind,movie:currentMovie(),permissions,browser:browserState,voiceMode,roomScreen:true,roomVoice:true,timeline:localTimeline});publishRoster();connectRoomVoice(c.peer);return;}handleHost(c.peer,m);});c.on('close',()=>{clearTimeout(timer);if(accepted&&clients.get(c.peer)===c){clients.delete(c.peer);roster.delete(c.peer);removeVoiceParticipant(c.peer);if(activeScreen===c.peer)setShared('');publishRoster();}});c.on('error',()=>c.close());});peer.on('call',acceptCall);peer.on('disconnected',()=>{status('Signaling interrupted');if(!leaving&&!peer.destroyed)try{peer.reconnect();}catch{}});peer.on('error',e=>{if(!joined){clearTimeout(timeout);fail(e.type==='peer-unavailable'?'Room not found. Ask the host to keep it open.':'Connection failed: '+(e.type||'unknown'));}else notice('Connection issue: '+(e.type||'unknown')+'. Some media may not connect.');});};
 function fail(s){if(peer){leaving=true;peer.destroy();peer=null;leaving=false;}$('start').disabled=false;status('Ready');toast(s);}
 function publishRoster(){const arr=[...roster.values()];broadcast({type:'roster',roster:arr});applyRoster(arr);}
 function applyRoster(arr){if(!Array.isArray(arr)||arr.length>MAX)return;roster=new Map(arr.filter(x=>typeof x?.id==='string').map(x=>[x.id,{id:x.id,name:safeName(x.name),mic:x.mic===true}]));for(const [k,c] of out)if(!roster.has(c.peer)){c.close();out.delete(k);}for(const [k,c] of incoming)if(!roster.has(c.peer)){c.close();incoming.delete(k);streams.delete(k);}if(activeScreen&&!roster.has(activeScreen))applyShared('');renderPeople();publishMedia();}
 function handleHost(who,m){if(!m||!roster.has(who))return;if(handleVoiceHost(who,m))return;if(handleRoomRequest(who,m))return;if(m.type==='chat'&&typeof m.text==='string'&&m.text.trim()){const msg={type:'chat',from:who,name:roster.get(who).name,text:m.text.trim().slice(0,1000)};displayChat(msg);broadcast(msg);}else if(m.type==='share'){if(m.on===true){if(activeScreen&&activeScreen!==who){if(who===me){stopShare(false);notice('Someone is already sharing.');}else send(clients.get(who),{type:'shareDenied'});return;}setShared(who,m.kind==='local'?'local':'screen');}else if(activeScreen===who)setShared('');}}
-function handleGuest(m){if(!m)return;switch(m.type){case 'voiceMode':setVoiceMode(m.enabled===true);break;case 'voicePCM':receiveVoicePacket(m.from,m.data);break;case 'voiceCapture':voiceSending=m.enabled===true;startVoiceCapture();break;case 'retryVoiceFor':if(roster.has(m.target)&&m.target!==me)retryPeerMedia(m.target,'av');break;case 'roster':applyRoster(m.roster);break;case 'chat':displayChat(m);break;case 'shared':applyShared(m.id,m.kind);break;case 'retryScreenFor':if(activeScreen===me&&roster.has(m.target))retryPeerMedia(m.target,'screen');break;case 'roomScreenOffer':receiveRoomScreenOffer(m);break;case 'permissions':applyPermissions(m.permissions);break;case 'browser':applyBrowser(m.url);break;case 'localPlaybackCommand':if(localPlayback&&activeScreen===me)executePlayback($('localMovie'),m.action);break;case 'shareDenied':stopShare(false);notice('Someone is already sharing.');break;case 'movie':applyMovie(m.state);break;}}
+function handleGuest(m){if(!m)return;switch(m.type){case 'voiceMode':setVoiceMode(m.enabled===true);break;case 'voicePCM':receiveVoicePacket(m.from,m.data);break;case 'voiceCapture':voiceSending=m.enabled===true;startVoiceCapture();break;case 'retryVoiceFor':if(roster.has(m.target)&&m.target!==me)retryPeerMedia(m.target,'av');break;case 'roster':applyRoster(m.roster);break;case 'chat':displayChat(m);break;case 'shared':applyShared(m.id,m.kind);break;case 'retryScreenFor':if(activeScreen===me&&roster.has(m.target))retryPeerMedia(m.target,'screen');break;case 'roomScreenOffer':receiveRoomScreenOffer(m);break;case 'permissions':applyPermissions(m.permissions);break;case 'browser':applyBrowser(m.url);break;case 'localPlaybackCommand':if(localPlayback&&activeScreen===me)executePlayback($('localMovie'),m.action);break;case 'localTimeline':applyLocalTimeline(m.timeline);break;case 'localSeek':if(localPlayback&&activeScreen===me&&m.source===localSeekId)seekLocal(m.time);break;case 'shareDenied':stopShare(false);notice('Someone is already sharing.');break;case 'movie':applyMovie(m.state);break;}}
 function displayChat(m){const item=document.createElement('div');item.className='msg'+(m.from===me?' self':'');const b=document.createElement('b'),d=document.createElement('div');b.textContent=m.from===me?'You':safeName(m.name);d.textContent=String(m.text||'').slice(0,1000);item.append(b,d);$('messages').append(item);while($('messages').children.length>250)$('messages').firstChild.remove();$('messages').scrollTop=$('messages').scrollHeight;}
 $('chatForm').onsubmit=e=>{e.preventDefault();const input=$('message');if(input.value.trim()&&joined){toHost({type:'chat',text:input.value});input.value='';}};$('chatToggle').onclick=()=>{const closed=!$('chat').hidden;$('chat').hidden=closed;document.querySelector('.workspace').classList.toggle('no-chat',closed);$('chatToggle').setAttribute('aria-pressed',String(!closed));};
 $('invite').onclick=async()=>{const link=inviteLink();try{await navigator.clipboard.writeText(link);toast('Invitation copied.');}catch{prompt('Share this private invitation:',link);}};
 function key(p,t){return p+'|'+t;}
 const roomScreenSupport = new WeakSet();
+const roomVoiceSupport = new WeakSet();
 const roomScreenLinks = new WeakMap();
 
 function roomScreenConnection(id) {
@@ -144,11 +145,11 @@ function roomScreenLink(connection) {
   let link = roomScreenLinks.get(connection);
   if (!link) {
     link = new RoomScreenLink(connection, message => send(connection, message), () => {
-      if (joined && !leaving) renderStage();
-    });
+      if (joined && !leaving) { renderStage(); renderPeople(); }
+    }, roomVoiceSupport.has(connection));
     roomScreenLinks.set(connection, link);
   }
-  link.setSource(activeScreen === me ? localScreen : null);
+  link.setSource(activeScreen === me ? localScreen : null, roomMicTrack());
   return link;
 }
 
@@ -171,8 +172,18 @@ function receiveRoomScreenOffer(message) {
 function syncRoomScreenSenders() {
   const source = activeScreen === me ? localScreen : null;
   for (const connection of host ? clients.values() : (up ? [up] : [])) {
-    roomScreenLinks.get(connection)?.setSource(source);
+    roomScreenLinks.get(connection)?.setSource(source, roomMicTrack());
   }
+}
+
+function connectRoomVoice(participant) {
+  const connection = clients.get(participant);
+  if (connection && roomVoiceSupport.has(connection) &&
+    (localMic() || roster.get(participant)?.mic)) tryRoomScreen(participant);
+}
+
+function roomMicTrack() {
+  return localAV.getAudioTracks().find(track => track.readyState === 'live' && track.enabled) || null;
 }
 
 function currentScreenStream() {
@@ -305,13 +316,15 @@ function playVoice(audio) {
   });
 }
 
-function renderPeople(){const root=$('people'),existing=new Map([...root.children].map(el=>[el.dataset.id,el]));for(const [p,person] of roster){let tile=existing.get(p);if(!tile){tile=document.createElement('div');tile.className='person';tile.dataset.id=p;const avatar=document.createElement('div');avatar.className='avatar';const v=document.createElement('video');v.autoplay=true;v.playsInline=true;v.muted=true;const n=document.createElement('span');n.className='name';const mic=document.createElement('span');mic.className='voice-indicator';tile.append(avatar,v,n,mic);if(p!==me){const range=document.createElement('input');range.type='range';range.min='0';range.max='1';range.step='.05';range.value=volumes.get(p)??1;range.className='vol';range.setAttribute('aria-label','Volume for '+person.name);range.oninput=()=>{const value=Number(range.value);volumes.set(p,value);const a=voiceElement(p);if(a)a.volume=value;const g=voiceGains.get(p);if(g)g.gain.value=value;};tile.append(range);}root.append(tile);}existing.delete(p);tile.querySelector('.avatar').textContent=person.name.charAt(0).toUpperCase();tile.querySelector('.name').textContent=p===me?name+' (you)':person.name;const s=p===me?localAV:streams.get(key(p,'av')),v=tile.querySelector('video'),tracks=s?.getVideoTracks().filter(t=>t.readyState==='live')||[];if(!tracks.length){if(v.srcObject)v.srcObject=null;}else if(!v.srcObject||v.srcObject.getVideoTracks().map(t=>t.id).join()!==tracks.map(t=>t.id).join()){v.srcObject=new MediaStream(tracks);play(v);}v.style.opacity=tracks.some(t=>t.enabled)?'1':'0';tile.querySelector('.voice-indicator').textContent=(p===me?localAV.getAudioTracks().some(t=>t.readyState==='live'):person.mic)?'MIC ON':'MIC OFF';if(p!==me)syncVoiceElement(p,s);}for(const el of existing.values())el.remove();for(const a of [...$('voiceAudio').children])if(!roster.has(a.dataset.id)){a.srcObject=null;a.remove();}for(const id of voiceGains.keys())if(!roster.has(id))clearVoicePlayback(id); $('count').textContent=roster.size+' / '+MAX;updateVoiceStatus();}
+function renderPeople(){const root=$('people'),existing=new Map([...root.children].map(el=>[el.dataset.id,el]));for(const [p,person] of roster){let tile=existing.get(p);if(!tile){tile=document.createElement('div');tile.className='person';tile.dataset.id=p;const avatar=document.createElement('div');avatar.className='avatar';const v=document.createElement('video');v.autoplay=true;v.playsInline=true;v.muted=true;const n=document.createElement('span');n.className='name';const mic=document.createElement('span');mic.className='voice-indicator';tile.append(avatar,v,n,mic);if(p!==me){const range=document.createElement('input');range.type='range';range.min='0';range.max='1';range.step='.05';range.value=volumes.get(p)??1;range.className='vol';range.setAttribute('aria-label','Volume for '+person.name);range.oninput=()=>{const value=Number(range.value);volumes.set(p,value);const a=voiceElement(p);if(a)a.volume=value;const g=voiceGains.get(p);if(g)g.gain.value=value;};tile.append(range);}root.append(tile);}existing.delete(p);tile.querySelector('.avatar').textContent=person.name.charAt(0).toUpperCase();tile.querySelector('.name').textContent=p===me?name+' (you)':person.name;const s=p===me?localAV:streams.get(key(p,'av')),v=tile.querySelector('video'),tracks=s?.getVideoTracks().filter(t=>t.readyState==='live')||[];if(!tracks.length){if(v.srcObject)v.srcObject=null;}else if(!v.srcObject||v.srcObject.getVideoTracks().map(t=>t.id).join()!==tracks.map(t=>t.id).join()){v.srcObject=new MediaStream(tracks);play(v);}v.style.opacity=tracks.some(t=>t.enabled)?'1':'0';tile.querySelector('.voice-indicator').textContent=(p===me?localAV.getAudioTracks().some(t=>t.readyState==='live'):person.mic)?'MIC ON':'MIC OFF';if(p!==me){const connection=roomScreenConnection(p);const link=connection&&roomScreenLinks.get(connection);syncVoiceElement(p,link?.voicePlayable?link.voice:s);}}for(const el of existing.values())el.remove();for(const a of [...$('voiceAudio').children])if(!roster.has(a.dataset.id)){a.srcObject=null;a.remove();}for(const id of voiceGains.keys())if(!roster.has(id))clearVoicePlayback(id); $('count').textContent=roster.size+' / '+MAX;updateVoiceStatus();}
 function localMic() {
-  return localAV.getAudioTracks().some(track => track.readyState === 'live' && track.enabled);
+  return !!roomMicTrack();
 }
 
 function announceMic() {
   if (joined) toHost({type: 'micState', on: localMic()});
+  syncRoomScreenSenders();
+  updateMicMonitor();
 }
 
 function syncVoiceSender(id) {
@@ -348,6 +361,8 @@ function handleVoiceHost(who, message) {
       person.mic = message.on === true;
       publishRoster();
     }
+    if (who === me) for (const id of clients.keys()) connectRoomVoice(id);
+    else connectRoomVoice(who);
     return true;
   }
   if (message.type === 'voiceBackup') {
@@ -468,6 +483,11 @@ function updateVoiceStatus() {
   if (!joined) return;
   const expected = [...roster.values()].filter(person => person.id !== me && person.mic);
   const backupCount = expected.filter(person => backupPlaying(person.id)).length;
+  const roomCount = expected.filter(({id}) => {
+    const connection = roomScreenConnection(id);
+    const audio = voiceElement(id);
+    return audio && connection && roomScreenLinks.get(connection)?.voicePlayable && !backupPlaying(id) && !audio.paused && !audio.muted;
+  }).length;
   const directCount = expected.filter(({id}) => {
     const audio = voiceElement(id);
     return !backupPlaying(id) && directVoiceReady(id) && !audio.paused && !audio.muted;
@@ -481,7 +501,8 @@ function updateVoiceStatus() {
   $('enableSound').hidden = !(needs || voiceNeedsTap);
   const label = voiceMode ? 'Room backup voice' : (backupInUse ? 'Backup voice' : 'Voice');
   const remote = expected.length ? (directCount + backupCount) + '/' + expected.length +
-    ' remote audio connected' + (backupCount ? ' (' + backupCount + ' on backup)' : '') : 'No remote mics on';
+    ' remote audio connected' + (backupCount ? ' (' + backupCount + ' on backup)' :
+      roomCount ? ' (' + roomCount + ' via room)' : '') : 'No remote mics on';
   $('voiceStatus').textContent = label + ' · ' + (localMic() ? 'Mic on' : 'Mic off') + ' · ' +
     ((!host && !up?.open) ? 'Room disconnected' : remote) + (needs ? ' · Tap Enable sound' : '');
 }
@@ -668,6 +689,54 @@ function enableSound() {
   updateVoiceStatus();
 }
 
+let micMonitor = null;
+let micMonitorTimer = null;
+
+function updateMicMonitor() {
+  const track = roomMicTrack();
+  if (micMonitor?.track === track) return;
+  clearInterval(micMonitorTimer);
+  micMonitor?.source.disconnect();
+  micMonitor?.analyser.disconnect();
+  micMonitor = null;
+  $('micLevel').value = 0;
+  $('micMeter').hidden = !track;
+  if (!track) return;
+  try {
+    const context = getVoiceContext();
+    const source = context.createMediaStreamSource(new MediaStream([track]));
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    micMonitor = {track, source, analyser};
+    micMonitorTimer = setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
+      let peak = 0;
+      for (const sample of samples) peak = Math.max(peak, Math.abs(sample - 128));
+      $('micLevel').value = track.muted ? 0 : peak;
+    }, 150);
+  } catch {}
+}
+
+$('testSpeakers').onclick = () => {
+  enableSound();
+  try {
+    const context = getVoiceContext();
+    const tone = context.createOscillator();
+    const gain = context.createGain();
+    const now = context.currentTime;
+    tone.frequency.value = 520;
+    gain.gain.setValueAtTime(0.035, now);
+    gain.gain.exponentialRampToValueAtTime(.001, now + .32);
+    tone.connect(gain).connect(context.destination);
+    tone.onended = () => { tone.disconnect(); gain.disconnect(); };
+    tone.start(now);
+    tone.stop(now + .33);
+    toast('Playing a test tone on this device.');
+  } catch { toast('Could not play the test tone.'); }
+};
+
 $('enableSound').onclick = enableSound;
 $('voiceRoute').onclick = () => {
   if (!joined || voiceMode) return;
@@ -695,7 +764,8 @@ $('voiceCompat').onclick = () => {
 
 async function toggleAV(kind){if(!joined)return;const btn=kind==='audio'?$('mic'):$('cam');btn.disabled=true;enableSound();try{const current=localAV.getTracks().find(t=>t.kind===kind);if(current){localAV.removeTrack(current);current.stop();}else{if(!navigator.mediaDevices?.getUserMedia)throw Error('Media devices unavailable');const s=await navigator.mediaDevices.getUserMedia(kind==='audio'?{audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}:{video:{width:{ideal:640},height:{ideal:360},frameRate:{ideal:24}}});const t=s.getTracks()[0];if(leaving||!joined){s.getTracks().forEach(track=>track.stop());return;}if(!t)throw Error('No matching device was found.');localAV.addTrack(t);t.onended=()=>{localAV.removeTrack(t);updateAV();announceMic();startVoiceCapture();republish('av');renderPeople();};}updateAV();announceMic();startVoiceCapture();republish('av');renderPeople();}catch(e){notice('Could not access '+kind+': '+e.message);}finally{btn.disabled=false;}}
 function updateAV(){for(const [kind,id,label] of [['audio','mic','Mic'],['video','cam','Camera']]){const on=localAV.getTracks().some(t=>t.kind===kind&&t.readyState==='live');$(id).textContent=label+(on?' on':' off');$(id).setAttribute('aria-pressed',String(on));}}$('mic').onclick=()=>toggleAV('audio');$('cam').onclick=()=>toggleAV('video');
-function setShared(who,kind='screen'){broadcast({type:'shared',id:who,kind});applyShared(who,kind);}function applyShared(who,kind='screen'){if(who!==activeScreen||!screenWaitAt){screenWaitAt=Date.now();screenRequestAt=0;autoplayBlocked=false;}activeScreen=typeof who==='string'?who:'';activeShareKind=kind==='local'?'local':'screen';syncRoomScreenSenders();renderStage();refreshAccess();}
+let localTimeline = null, localSeekId = '';
+function setShared(who,kind='screen'){broadcast({type:'shared',id:who,kind});applyShared(who,kind);}function applyShared(who,kind='screen'){if(who!==activeScreen||kind!==activeShareKind||!screenWaitAt){localTimeline=null;screenWaitAt=Date.now();screenRequestAt=0;autoplayBlocked=false;}activeScreen=typeof who==='string'?who:'';activeShareKind=kind==='local'?'local':'screen';syncRoomScreenSenders();renderStage();refreshAccess();}
 let choosingShare = false;
 async function share(preferTab = false) {
   if (!joined || leaving || choosingShare) return;
@@ -737,26 +807,127 @@ async function share(preferTab = false) {
     choosingShare = false;
   }
 }
-function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');$('share').textContent='Share screen';$('share').setAttribute('aria-pressed','false');if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
+function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;localSeekId='';if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');$('share').textContent='Share screen';$('share').setAttribute('aria-pressed','false');if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
 function renderStage(){const ownLocal=(localPlayback||pendingLocal)&&(!activeScreen||activeScreen===me);const s=currentScreenStream();const sharing=!!activeScreen||ownLocal;const browsing=!sharing&&!!browserState;const youtube=!sharing&&!browsing&&isYouTubeMovie();$('browserStage').hidden=!browsing;updateYouTubeStage(youtube);$('localMovie').hidden=!ownLocal;ui.screen.hidden=ownLocal||!sharing||!s;ui.movie.hidden=sharing||browsing||!movieState||youtube;$('empty').hidden=ownLocal||browsing||(sharing&&!!s)||(!sharing&&!!movieState);const displayStream=ownLocal?null:s||null;if(ui.screen.srcObject!==displayStream){autoplayBlocked=false;ui.screen.srcObject=displayStream;ui.screen.muted=activeScreen===me;if(displayStream){ui.screen.playsInline=true;ui.screen.autoplay=true;play(ui.screen);}}if(sharing&&!s&&!ownLocal){$('empty').querySelector('h2').textContent='Connecting to shared screen…';}else $('empty').querySelector('h2').textContent='Make it movie night.';if((sharing||browsing)&&!ui.movie.paused)ui.movie.pause();refreshAccess();updateMediaOverlay();}
 
 function chooseLocal(){if(!joined)return;if(localPlayback||pendingLocal){stopShare();return;}if(localScreen||activeScreen){toast('Stop the current share first.');return;}$('localFile').click();}
 $('localLabel').onclick=chooseLocal;$('emptyLocal').onclick=chooseLocal;
-$('localFile').onchange=async()=>{const file=$('localFile').files[0];$('localFile').value='';if(!file||!joined||localScreen||activeScreen||pendingLocal)return;const v=$('localMovie'),capture=v.captureStream||v.mozCaptureStream;if(!capture){notice('Local video streaming is unavailable in this browser. Use desktop Chrome or Edge.');return;}pendingLocal=true;const url=URL.createObjectURL(file);localURL=url;v.src=url;v.volume=Number($('movieVolume').value);renderStage();$('localLabel').textContent='Loading video…';try{await new Promise((resolve,reject)=>{if(v.readyState>=2){resolve();return;}const timer=setTimeout(()=>{cleanup();reject(Error('Video did not load'));},15000);function cleanup(){clearTimeout(timer);v.removeEventListener('loadeddata',ready);v.removeEventListener('error',bad);}function ready(){cleanup();resolve();}function bad(){cleanup();reject(Error('Unsupported format. Try MP4 (H.264/AAC) or WebM.'));}v.addEventListener('loadeddata',ready,{once:true});v.addEventListener('error',bad,{once:true});});if(!pendingLocal||localURL!==url)return;if(activeScreen){stopShare(false);notice('Another participant started sharing.');return;}const stream=capture.call(v);if(!stream.getVideoTracks().length){v.play().catch(()=>{});await new Promise(resolve=>{let timer;const done=()=>{clearTimeout(timer);stream.removeEventListener('addtrack',check);resolve();};const check=()=>{if(stream.getVideoTracks().length)done();};timer=setTimeout(done,2500);stream.addEventListener('addtrack',check);check();});}if(!pendingLocal||localURL!==url){stream.getTracks().forEach(t=>t.stop());return;}if(!stream.getVideoTracks().length){stream.getTracks().forEach(t=>t.stop());throw Error('Cannot capture video. Try desktop Chrome or Edge.');}if(activeScreen){stream.getTracks().forEach(t=>t.stop());stopShare(false);return;}localScreen=stream;localPlayback=true;pendingLocal=false;const changed=()=>{if(localScreen===stream)republish('screen');};stream.addEventListener('addtrack',changed);stream.addEventListener('removetrack',changed);toHost({type:'share',on:true,kind:'local'});if(!localScreen)return;$('share').textContent='Stop sharing';$('share').setAttribute('aria-pressed','true');$('localLabel').textContent='Stop local video';$('localLabel').setAttribute('aria-pressed','true');publishMedia();renderStage();v.play().catch(()=>toast('Press play on the movie.'));notice(stream.getAudioTracks().length?'Local video is streaming directly to the room. No upload.':'No audio track captured. Check the file or browser.');}catch(e){if(localURL===url){stopShare(false);notice(e.message||'Could not play video.');}}};
+$('localFile').onchange=async()=>{const file=$('localFile').files[0];$('localFile').value='';if(!file||!joined||localScreen||activeScreen||pendingLocal)return;const v=$('localMovie'),capture=v.captureStream||v.mozCaptureStream;if(!capture){notice('Local video streaming is unavailable in this browser. Use desktop Chrome or Edge.');return;}pendingLocal=true;const url=URL.createObjectURL(file);localURL=url;v.src=url;v.volume=Number($('movieVolume').value);renderStage();$('localLabel').textContent='Loading video…';try{await new Promise((resolve,reject)=>{if(v.readyState>=2){resolve();return;}const timer=setTimeout(()=>{cleanup();reject(Error('Video did not load'));},15000);function cleanup(){clearTimeout(timer);v.removeEventListener('loadeddata',ready);v.removeEventListener('error',bad);}function ready(){cleanup();resolve();}function bad(){cleanup();reject(Error('Unsupported format. Try MP4 (H.264/AAC) or WebM.'));}v.addEventListener('loadeddata',ready,{once:true});v.addEventListener('error',bad,{once:true});});if(!pendingLocal||localURL!==url)return;if(activeScreen){stopShare(false);notice('Another participant started sharing.');return;}const stream=capture.call(v);if(!stream.getVideoTracks().length){v.play().catch(()=>{});await new Promise(resolve=>{let timer;const done=()=>{clearTimeout(timer);stream.removeEventListener('addtrack',check);resolve();};const check=()=>{if(stream.getVideoTracks().length)done();};timer=setTimeout(done,2500);stream.addEventListener('addtrack',check);check();});}if(!pendingLocal||localURL!==url){stream.getTracks().forEach(t=>t.stop());return;}if(!stream.getVideoTracks().length){stream.getTracks().forEach(t=>t.stop());throw Error('Cannot capture video. Try desktop Chrome or Edge.');}if(activeScreen){stream.getTracks().forEach(t=>t.stop());stopShare(false);return;}localScreen=stream;localPlayback=true;pendingLocal=false;localSeekId=id();const changed=()=>{if(localScreen===stream)republish('screen');};stream.addEventListener('addtrack',changed);stream.addEventListener('removetrack',changed);toHost({type:'share',on:true,kind:'local'});announceLocalTimeline();if(!localScreen)return;$('share').textContent='Stop sharing';$('share').setAttribute('aria-pressed','true');$('localLabel').textContent='Stop local video';$('localLabel').setAttribute('aria-pressed','true');publishMedia();renderStage();v.play().catch(()=>toast('Press play on the movie.'));notice(stream.getAudioTracks().length?'Local video is streaming directly to the room. No upload.':'No audio track captured. Check the file or browser.');}catch(e){if(localURL===url){stopShare(false);notice(e.message||'Could not play video.');}}};
 
 function canPlayback(){return host||permissions.playback===true;}
 function canBrowse(){return host||permissions.browse===true;}
-function applyPermissions(p){permissions={playback:p?.playback===true,browse:p?.browse===true};refreshAccess();}
-function refreshAccess(){const browse=canBrowse(), playback=canPlayback(), connected=joined&&(host||!!up?.open);$('permissionsToggle').hidden=!host;$('allowPlayback').checked=permissions.playback;$('allowBrowse').checked=permissions.browse;$('browserURL').disabled=!browse||!connected;$('browserGo').disabled=!browse||!connected;$('browserReload').disabled=!browse||!connected||!browserState;$('browserClose').disabled=!browse||!connected||!browserState;$('browserLock').hidden=browse;$('browserFrame').inert=!browse;$('browserFrame').tabIndex=browse?0:-1;$('browserFrame').style.pointerEvents=browse?'auto':'none';$('browserExternal').hidden=!browse||!browserState;$('browserShareTab').hidden=!connected||!browse||!browserState;$('browserShareTab').disabled=!!activeScreen;$('permissionStatus').textContent=host?'Host':(permissions.playback?'Playback allowed':'Playback locked')+' · '+(permissions.browse?'Browser allowed':'Browser locked');const playable=activeScreen?activeShareKind==='local':!!movieState&&!browserState;const own=localPlayback&&activeScreen===me;$('sharedControls').hidden=!(playable&&(playback||own));$('roomPlay').disabled=!connected||!(playback||own);$('roomPause').disabled=!connected||!(playback||own);}
+function applyPermissions(p){permissions={playback:p?.playback===true,browse:p?.browse===true,seek:p?.seek===true};refreshAccess();}
+function refreshAccess(){const browse=canBrowse(), playback=canPlayback(), connected=joined&&(host||!!up?.open);$('permissionsToggle').hidden=!host;$('allowPlayback').checked=permissions.playback;$('allowBrowse').checked=permissions.browse;$('allowSeek').checked=permissions.seek;$('browserURL').disabled=!browse||!connected;$('browserGo').disabled=!browse||!connected;$('browserReload').disabled=!browse||!connected||!browserState;$('browserClose').disabled=!browse||!connected||!browserState;$('browserLock').hidden=browse;$('browserFrame').inert=!browse;$('browserFrame').tabIndex=browse?0:-1;$('browserFrame').style.pointerEvents=browse?'auto':'none';$('browserExternal').hidden=!browse||!browserState;$('browserShareTab').hidden=!connected||!browse||!browserState;$('browserShareTab').disabled=!!activeScreen;$('permissionStatus').textContent=host?'Host':(permissions.playback?'Playback allowed':'Playback locked')+' · '+(permissions.browse?'Browser allowed':'Browser locked')+(permissions.seek?' · Seeking allowed':'');const playable=activeScreen?activeShareKind==='local':!!movieState&&!browserState;const own=localPlayback&&activeScreen===me;$('sharedControls').hidden=!(playable&&(playback||own));$('roomPlay').disabled=!connected||!(playback||own);$('roomPause').disabled=!connected||!(playback||own);updateSeekControls();}
 $('permissionsToggle').onclick=()=>{if(!host)return;const panel=$('permissionsPanel');panel.hidden=!panel.hidden;$('permissionsToggle').setAttribute('aria-expanded',String(!panel.hidden));};
-function changePermissions(){if(!host||!joined)return;applyPermissions({playback:$('allowPlayback').checked,browse:$('allowBrowse').checked});broadcast({type:'permissions',permissions});toast('Guest permissions updated.');}
-$('allowPlayback').onchange=changePermissions;$('allowBrowse').onchange=changePermissions;
+function changePermissions(){if(!host||!joined)return;applyPermissions({playback:$('allowPlayback').checked,browse:$('allowBrowse').checked,seek:$('allowSeek').checked});broadcast({type:'permissions',permissions});toast('Guest permissions updated.');}
+$('allowPlayback').onchange=changePermissions;$('allowBrowse').onchange=changePermissions;$('allowSeek').onchange=changePermissions;
 function browserURL(v){const u=normalizeSourceURL(v);if(!u||u.length>2048)return '';try{if(new URL(u).origin===location.origin)return '';return u;}catch{return '';}}
 function selectBrowser(on){browserSelected=on;$('browserBar').hidden=!on;$('videoBar').hidden=on;$('browserMode').setAttribute('aria-pressed',String(on));$('videoMode').setAttribute('aria-pressed',String(!on));refreshAccess();}
 function applyBrowser(raw){const url=raw?browserURL(raw):'';const changed=browserState!==url;browserState=url;const frame=$('browserFrame');if(changed){if(url)frame.src=url;else frame.removeAttribute('src');}if(url){$('browserURL').value=url;$('browserExternal').href=url;selectBrowser(true);}else{if(changed)$('browserURL').value='';$('browserExternal').removeAttribute('href');}renderStage();}
 function setBrowser(url){if(!host)return;if(url&&movieState){clearMovie();broadcast({type:'movie',state:null});}applyBrowser(url);broadcast({type:'browser',url});}
+function timelineTime(value, duration) {
+  return Number.isFinite(value) ? Math.max(0, Math.min(duration, value)) : null;
+}
+
+function seekableTimeline(source, time, duration) {
+  if (!/^[a-f0-9]{32}$/.test(source || '') || !Number.isFinite(duration) || duration <= 0) return null;
+  const position = timelineTime(time, duration);
+  return position === null ? null : {source, time: position, duration};
+}
+
+function applyLocalTimeline(raw) {
+  if (!activeScreen || activeShareKind !== 'local') return;
+  const next = seekableTimeline(raw?.source, raw?.time, raw?.duration);
+  if (next) { localTimeline = next; updateSeekControls(); }
+}
+
+function announceLocalTimeline() {
+  if (!joined || leaving || !localPlayback) return;
+  const video = $('localMovie');
+  const timeline = seekableTimeline(localSeekId, video.currentTime, video.duration);
+  if (timeline) toHost({type: 'localTimeline', timeline});
+}
+
+function roomTimeline() {
+  if (activeScreen) {
+    if (activeShareKind !== 'local') return null;
+    return localTimeline;
+  }
+  if (browserState || !movieState) return null;
+  if (!isYouTubeMovie()) return seekableTimeline(movieState.seekId, ui.movie.currentTime, ui.movie.duration);
+  if (!youtubeSession?.ready) return null;
+  const player = youtubeSession.player;
+  return seekableTimeline(movieState.seekId, player.getCurrentTime(), player.getDuration());
+}
+
+const seekSlider = $('roomSeek');
+let previewingSeek = false;
+
+function timeLabel(value) {
+  const seconds = Math.floor(value || 0);
+  const minutes = Math.floor(seconds / 60);
+  return minutes + ':' + String(seconds % 60).padStart(2, '0');
+}
+
+function updateSeekControls() {
+  const timeline = roomTimeline();
+  const allowed = joined && (host || !!up?.open) && (host || permissions.seek) && timeline;
+  $('seekControls').hidden = !allowed;
+  if (!allowed) { previewingSeek = false; delete seekSlider.dataset.source; return; }
+  if (seekSlider.dataset.source !== timeline.source) previewingSeek = false;
+  if (previewingSeek) return;
+  seekSlider.dataset.source = timeline.source;
+  seekSlider.max = timeline.duration;
+  seekSlider.value = timeline.time;
+  $('seekPosition').textContent = timeLabel(timeline.time) + ' / ' + timeLabel(timeline.duration);
+}
+
+seekSlider.oninput = () => {
+  previewingSeek = true;
+  $('seekPosition').textContent = timeLabel(Number(seekSlider.value)) + ' / ' + timeLabel(Number(seekSlider.max));
+};
+seekSlider.onchange = () => {
+  const source = seekSlider.dataset.source;
+  const time = Number(seekSlider.value);
+  previewingSeek = false;
+  if (source && (host || permissions.seek)) toHost({type: 'seekRequest', source, time});
+};
+seekSlider.onblur = () => { previewingSeek = false; updateSeekControls(); };
+
+function seekLocal(time) {
+  const video = $('localMovie');
+  const position = timelineTime(time, video.duration);
+  if (position !== null && Number.isFinite(video.duration)) video.currentTime = position;
+}
+
+function applyRoomSeek(who, message) {
+  if (who !== me && !permissions.seek) return;
+  const timeline = roomTimeline();
+  if (!timeline || message.source !== timeline.source) return;
+  const position = timelineTime(message.time, timeline.duration);
+  if (position === null) return;
+  if (activeScreen) {
+    if (activeScreen === me) seekLocal(position);
+    else send(clients.get(activeScreen), {type: 'localSeek', source: timeline.source, time: position});
+  } else if (isYouTubeMovie()) {
+    const player = youtubeSession.player;
+    player.seekTo(position, true);
+    if (movieState.paused) player.pauseVideo();
+    syncMovie();
+  } else {
+    ui.movie.currentTime = position;
+    syncMovie();
+  }
+}
+
+for (const event of ['loadedmetadata', 'durationchange', 'seeked', 'play', 'pause']) {
+  $('localMovie').addEventListener(event, announceLocalTimeline);
+}
+
 function executePlayback(v,action){if(action==='pause')v.pause();else if(action==='play')v.play().catch(()=>notice('Playback requires a tap on the video on the sender device.'));}
 function handleRoomRequest(who,m){if(!host)return false;const owner=who===me;if(m.type==='roomScreenAnswer'){const connection=clients.get(who);if(connection&&validRoomScreenSignal(m))roomScreenLinks.get(connection)?.acceptAnswer(m);return true;}
+if(m.type==='seekRequest'){applyRoomSeek(who,m);return true;}
+if(m.type==='localTimeline'){if(activeScreen===who&&activeShareKind==='local'){applyLocalTimeline(m.timeline);if(localTimeline)broadcast({type:'localTimeline',timeline:localTimeline});}return true;}
 if(m.type==='mediaRetry'){if(!activeScreen||activeScreen===who)return true;const now=Date.now();if(now-(lastMediaRequest.get(who)||0)<5000)return true;lastMediaRequest.set(who,now);if(activeScreen===me){if(!tryRoomScreen(who))retryPeerMedia(who,'screen');}else if(!(owner&&tryRoomScreen(activeScreen)))send(clients.get(activeScreen),{type:'retryScreenFor',target:who});return true;}
 if(m.type==='browserRequest'){if(!(owner||permissions.browse)){if(!owner)send(clients.get(who),{type:'permissions',permissions});return true;}if(m.url===''){setBrowser('');return true;}const url=typeof m.url==='string'?browserURL(m.url):'';if(!url||activeScreen||pendingLocal||localPlayback)return true;const youtube=readYouTubeLink(url);if(youtube||isDirectVideo(url))loadMovie(url,youtube);else setBrowser(url);return true;}
 if(m.type==='playbackRequest'){if(!['play','pause'].includes(m.action))return true;const sourceOwn=activeScreen===who&&activeShareKind==='local';if(!(owner||permissions.playback||sourceOwn))return true;if(activeScreen){if(activeShareKind!=='local')return true;if(activeScreen===me){if(localPlayback)executePlayback($('localMovie'),m.action);}else send(clients.get(activeScreen),{type:'localPlaybackCommand',action:m.action});}else if(movieState&&!browserState){if(isYouTubeMovie())youtubePlayback(m.action);else{executePlayback(ui.movie,m.action);syncMovie();}}return true;}return false;}
@@ -1004,6 +1175,7 @@ function loadMovie(url, youtube = readYouTubeLink(url)) {
   $('mediaURL').value = url;
   movieState = youtube ? {...youtube, kind: 'youtube', paused: true, rate: 1, at: Date.now()} :
     {url, time: 0, paused: true, rate: 1, at: Date.now()};
+  movieState.seekId = id();
   if (youtube) mountYouTube(movieState);
   else {
     ui.movie.src = url;
@@ -1040,7 +1212,8 @@ function applyMovie(raw) {
   const time = Number(raw.time);
   const at = Number(raw.at);
   const state = {url, time: Number.isFinite(time) ? Math.max(0, time) : 0, paused: raw.paused !== false,
-    rate: Math.min(2, Math.max(.25, Number(raw.rate) || 1)), at: Number.isFinite(at) ? at : Date.now()};
+    rate: Math.min(2, Math.max(.25, Number(raw.rate) || 1)), at: Number.isFinite(at) ? at : Date.now(),
+    seekId: typeof raw.seekId === 'string' ? raw.seekId : ''};
   const changed = movieState?.url !== url || isYouTubeMovie() !== !!youtube;
   if (changed) clearMovieElement();
   movieState = youtube ? {...state, kind: 'youtube', id: youtube.id} : state;
@@ -1074,6 +1247,8 @@ for (const event of ['play', 'pause', 'seeked', 'ratechange', 'ended']) {
 }
 setInterval(() => {
   if (host && joined && (isYouTubeMovie() || (movieState && !ui.movie.paused))) syncMovie();
+  updateSeekControls();
+  if (localPlayback && !$('localMovie').paused) announceLocalTimeline();
 }, 3000);
 $('youtubeStart').onclick = () => {
   youtubePlayback('play');
@@ -1087,4 +1262,4 @@ $('movieVolume').oninput = () => {
   if (youtubeSession?.ready) youtubeSession.player.setVolume(volume * 100);
 };
 $('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen?.();else if($('stage').requestFullscreen)$('stage').requestFullscreen().catch(()=>toast('Fullscreen unavailable'));else if(!$('localMovie').hidden)$('localMovie').webkitEnterFullscreen?.();else if(!ui.movie.hidden)ui.movie.webkitEnterFullscreen?.();else if(!ui.screen.hidden)ui.screen.webkitEnterFullscreen?.();};
-$('leave').onclick=()=>{leaving=true;stopShare(false);localAV.getTracks().forEach(t=>t.stop());clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installFrame(){if(standalone()){toast('Frame is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Frame.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Frame.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installFrame;installHelp.onclick=installFrame;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
+$('leave').onclick=()=>{leaving=true;stopShare(false);localAV.getTracks().forEach(t=>t.stop());updateMicMonitor();clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;clearInterval(micMonitorTimer);stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installFrame(){if(standalone()){toast('Frame is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Frame.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Frame.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installFrame;installHelp.onclick=installFrame;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
