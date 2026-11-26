@@ -634,9 +634,49 @@ $('voiceCompat').onclick = () => {
 async function toggleAV(kind){if(!joined)return;const btn=kind==='audio'?$('mic'):$('cam');btn.disabled=true;enableSound();try{const current=localAV.getTracks().find(t=>t.kind===kind);if(current){localAV.removeTrack(current);current.stop();}else{if(!navigator.mediaDevices?.getUserMedia)throw Error('Media devices unavailable');const s=await navigator.mediaDevices.getUserMedia(kind==='audio'?{audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}:{video:{width:{ideal:640},height:{ideal:360},frameRate:{ideal:24}}});const t=s.getTracks()[0];if(leaving||!joined){s.getTracks().forEach(track=>track.stop());return;}if(!t)throw Error('No matching device was found.');localAV.addTrack(t);t.onended=()=>{localAV.removeTrack(t);updateAV();announceMic();startVoiceCapture();republish('av');renderPeople();};}updateAV();announceMic();startVoiceCapture();republish('av');renderPeople();}catch(e){notice('Could not access '+kind+': '+e.message);}finally{btn.disabled=false;}}
 function updateAV(){for(const [kind,id,label] of [['audio','mic','Mic'],['video','cam','Camera']]){const on=localAV.getTracks().some(t=>t.kind===kind&&t.readyState==='live');$(id).textContent=label+(on?' on':' off');$(id).setAttribute('aria-pressed',String(on));}}$('mic').onclick=()=>toggleAV('audio');$('cam').onclick=()=>toggleAV('video');
 function setShared(who,kind='screen'){activeScreen=who;activeShareKind=kind;broadcast({type:'shared',id:who,kind});applyShared(who,kind);}function applyShared(who,kind='screen'){if(who!==activeScreen||!screenWaitAt){screenWaitAt=Date.now();screenRequestAt=0;autoplayBlocked=false;}activeScreen=typeof who==='string'?who:'';activeShareKind=kind==='local'?'local':'screen';renderStage();refreshAccess();}
-async function share(){if(pendingLocal){stopShare(false);return;}if(localScreen){stopShare();return;}if(activeScreen){toast('Someone is already sharing.');return;}if(!navigator.mediaDevices?.getDisplayMedia){notice('Screen sharing is unavailable on this browser. Use desktop Chrome or Edge.');return;}try{localScreen=await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}},audio:true});localScreen.getVideoTracks()[0].onended=()=>stopShare();toHost({type:'share',on:true});if(!localScreen)return;$('share').textContent='Stop sharing';$('share').setAttribute('aria-pressed','true');publishMedia();renderStage();if(!localScreen.getAudioTracks().length)notice('Screen shared without audio. Choose a browser tab and enable share audio.');}catch(e){notice('Screen share not started: '+e.message);}}
-function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');$('share').textContent='Share screen';$('share').setAttribute('aria-pressed','false');if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=share;$('emptyShare').onclick=share;
-function renderStage(){const ownLocal=(localPlayback||pendingLocal)&&(!activeScreen||activeScreen===me);const s=activeScreen===me?localScreen:streams.get(key(activeScreen,'screen'));const sharing=!!activeScreen||ownLocal;const browsing=!sharing&&!!browserState;$('browserStage').hidden=!browsing;$('localMovie').hidden=!ownLocal;ui.screen.hidden=ownLocal||!sharing||!s;ui.movie.hidden=sharing||browsing||!movieState;$('empty').hidden=ownLocal||browsing||(sharing&&!!s)||(!sharing&&!!movieState);const displayStream=ownLocal?null:s||null;if(ui.screen.srcObject!==displayStream){ui.screen.srcObject=displayStream;ui.screen.muted=activeScreen===me;if(displayStream){ui.screen.playsInline=true;ui.screen.autoplay=true;play(ui.screen);}}if(sharing&&!s&&!ownLocal){$('empty').querySelector('h2').textContent='Connecting to shared screen…';}else $('empty').querySelector('h2').textContent='Make it movie night.';if((sharing||browsing)&&!ui.movie.paused)ui.movie.pause();refreshAccess();updateMediaOverlay();}
+let choosingShare = false;
+async function share(preferTab = false) {
+  if (!joined || leaving || choosingShare) return;
+  if (pendingLocal) { stopShare(false); return; }
+  if (localScreen) { stopShare(); return; }
+  if (activeScreen) { toast('Someone is already sharing.'); return; }
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    notice('To share a tab, open Frame on desktop Chrome or Edge.');
+    return;
+  }
+  choosingShare = true;
+  const video = {width: {ideal: 1920}, height: {ideal: 1080}, frameRate: {ideal: 30}};
+  const options = preferTab ? {
+    video: {...video, displaySurface: 'browser'}, audio: true,
+    selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'exclude', surfaceSwitching: 'include'
+  } : {video, audio: true};
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia(options);
+    const track = stream.getVideoTracks()[0];
+    if (!track || leaving || !joined || (!host && !up?.open) || activeScreen || localScreen || pendingLocal) {
+      stream.getTracks().forEach(item => item.stop());
+      if (!leaving) toast('The room or share changed while the picker was open.');
+      return;
+    }
+    localScreen = stream;
+    track.onended = () => stopShare();
+    toHost({type: 'share', on: true});
+    if (!localScreen) return;
+    $('share').textContent = 'Stop sharing';
+    $('share').setAttribute('aria-pressed', 'true');
+    publishMedia();
+    renderStage();
+    if (!stream.getAudioTracks().length) {
+      notice('Sharing without sound. To include sound, share a browser tab and turn on tab audio in the picker.');
+    }
+  } catch (error) {
+    notice(error.name === 'NotAllowedError' ? 'Sharing canceled or blocked. Select the tab and allow sharing to try again.' : 'Could not start sharing. Try desktop Chrome or Edge.');
+  } finally {
+    choosingShare = false;
+  }
+}
+function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');$('share').textContent='Share screen';$('share').setAttribute('aria-pressed','false');if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
+function renderStage(){const ownLocal=(localPlayback||pendingLocal)&&(!activeScreen||activeScreen===me);const s=activeScreen===me?localScreen:streams.get(key(activeScreen,'screen'));const sharing=!!activeScreen||ownLocal;const browsing=!sharing&&!!browserState;const youtube=!sharing&&!browsing&&isYouTubeMovie();$('browserStage').hidden=!browsing;updateYouTubeStage(youtube);$('localMovie').hidden=!ownLocal;ui.screen.hidden=ownLocal||!sharing||!s;ui.movie.hidden=sharing||browsing||!movieState||youtube;$('empty').hidden=ownLocal||browsing||(sharing&&!!s)||(!sharing&&!!movieState);const displayStream=ownLocal?null:s||null;if(ui.screen.srcObject!==displayStream){ui.screen.srcObject=displayStream;ui.screen.muted=activeScreen===me;if(displayStream){ui.screen.playsInline=true;ui.screen.autoplay=true;play(ui.screen);}}if(sharing&&!s&&!ownLocal){$('empty').querySelector('h2').textContent='Connecting to shared screen…';}else $('empty').querySelector('h2').textContent='Make it movie night.';if((sharing||browsing)&&!ui.movie.paused)ui.movie.pause();refreshAccess();updateMediaOverlay();}
 
 function chooseLocal(){if(!joined)return;if(localPlayback||pendingLocal){stopShare();return;}if(localScreen||activeScreen){toast('Stop the current share first.');return;}$('localFile').click();}
 $('localLabel').onclick=chooseLocal;$('emptyLocal').onclick=chooseLocal;
@@ -645,27 +685,343 @@ $('localFile').onchange=async()=>{const file=$('localFile').files[0];$('localFil
 function canPlayback(){return host||permissions.playback===true;}
 function canBrowse(){return host||permissions.browse===true;}
 function applyPermissions(p){permissions={playback:p?.playback===true,browse:p?.browse===true};refreshAccess();}
-function refreshAccess(){const browse=canBrowse(), playback=canPlayback(), connected=joined&&(host||!!up?.open);$('permissionsToggle').hidden=!host;$('allowPlayback').checked=permissions.playback;$('allowBrowse').checked=permissions.browse;$('browserURL').disabled=!browse||!connected;$('browserGo').disabled=!browse||!connected;$('browserReload').disabled=!browse||!connected||!browserState;$('browserClose').disabled=!browse||!connected||!browserState;$('browserLock').hidden=browse;$('browserFrame').inert=!browse;$('browserFrame').tabIndex=browse?0:-1;$('browserFrame').style.pointerEvents=browse?'auto':'none';$('browserExternal').hidden=!browse||!browserState;$('permissionStatus').textContent=host?'Host':(permissions.playback?'Playback allowed':'Playback locked')+' · '+(permissions.browse?'Browser allowed':'Browser locked');const playable=activeScreen?activeShareKind==='local':!!movieState&&!browserState;const own=localPlayback&&activeScreen===me;$('sharedControls').hidden=!(playable&&(playback||own));$('roomPlay').disabled=!connected||!(playback||own);$('roomPause').disabled=!connected||!(playback||own);}
+function refreshAccess(){const browse=canBrowse(), playback=canPlayback(), connected=joined&&(host||!!up?.open);$('permissionsToggle').hidden=!host;$('allowPlayback').checked=permissions.playback;$('allowBrowse').checked=permissions.browse;$('browserURL').disabled=!browse||!connected;$('browserGo').disabled=!browse||!connected;$('browserReload').disabled=!browse||!connected||!browserState;$('browserClose').disabled=!browse||!connected||!browserState;$('browserLock').hidden=browse;$('browserFrame').inert=!browse;$('browserFrame').tabIndex=browse?0:-1;$('browserFrame').style.pointerEvents=browse?'auto':'none';$('browserExternal').hidden=!browse||!browserState;$('browserShareTab').hidden=!connected||!browse||!browserState;$('browserShareTab').disabled=!!activeScreen;$('permissionStatus').textContent=host?'Host':(permissions.playback?'Playback allowed':'Playback locked')+' · '+(permissions.browse?'Browser allowed':'Browser locked');const playable=activeScreen?activeShareKind==='local':!!movieState&&!browserState;const own=localPlayback&&activeScreen===me;$('sharedControls').hidden=!(playable&&(playback||own));$('roomPlay').disabled=!connected||!(playback||own);$('roomPause').disabled=!connected||!(playback||own);}
 $('permissionsToggle').onclick=()=>{if(!host)return;const panel=$('permissionsPanel');panel.hidden=!panel.hidden;$('permissionsToggle').setAttribute('aria-expanded',String(!panel.hidden));};
 function changePermissions(){if(!host||!joined)return;applyPermissions({playback:$('allowPlayback').checked,browse:$('allowBrowse').checked});broadcast({type:'permissions',permissions});toast('Guest permissions updated.');}
 $('allowPlayback').onchange=changePermissions;$('allowBrowse').onchange=changePermissions;
-function browserURL(v){const u=validURL(v);if(!u||u.length>2048)return '';try{if(new URL(u).origin===location.origin)return '';return u;}catch{return '';}}
+function browserURL(v){const u=normalizeSourceURL(v);if(!u||u.length>2048)return '';try{if(new URL(u).origin===location.origin)return '';return u;}catch{return '';}}
 function selectBrowser(on){browserSelected=on;$('browserBar').hidden=!on;$('videoBar').hidden=on;$('browserMode').setAttribute('aria-pressed',String(on));$('videoMode').setAttribute('aria-pressed',String(!on));refreshAccess();}
 function applyBrowser(raw){const url=raw?browserURL(raw):'';const changed=browserState!==url;browserState=url;const frame=$('browserFrame');if(changed){if(url)frame.src=url;else frame.removeAttribute('src');}if(url){$('browserURL').value=url;$('browserExternal').href=url;selectBrowser(true);}else{if(changed)$('browserURL').value='';$('browserExternal').removeAttribute('href');}renderStage();}
-function setBrowser(url){if(!host)return;if(url&&movieState){movieState=null;ui.movie.pause();ui.movie.removeAttribute('src');ui.movie.load();broadcast({type:'movie',state:null});}applyBrowser(url);broadcast({type:'browser',url});}
+function setBrowser(url){if(!host)return;if(url&&movieState){clearMovie();broadcast({type:'movie',state:null});}applyBrowser(url);broadcast({type:'browser',url});}
 function executePlayback(v,action){if(action==='pause')v.pause();else if(action==='play')v.play().catch(()=>notice('Playback requires a tap on the video on the sender device.'));}
 function handleRoomRequest(who,m){if(!host)return false;const owner=who===me;if(m.type==='mediaRetry'){if(!activeScreen||activeScreen===who)return true;const now=Date.now();if(now-(lastMediaRequest.get(who)||0)<5000)return true;lastMediaRequest.set(who,now);if(activeScreen===me)retryPeerMedia(who,'screen');else send(clients.get(activeScreen),{type:'retryScreenFor',target:who});return true;}
-if(m.type==='browserRequest'){if(!(owner||permissions.browse)){if(!owner)send(clients.get(who),{type:'permissions',permissions});return true;}if(m.url===''){setBrowser('');return true;}const url=typeof m.url==='string'?browserURL(m.url):'';if(!url||activeScreen)return true;setBrowser(url);return true;}
-if(m.type==='playbackRequest'){if(!['play','pause'].includes(m.action))return true;const sourceOwn=activeScreen===who&&activeShareKind==='local';if(!(owner||permissions.playback||sourceOwn))return true;if(activeScreen){if(activeShareKind!=='local')return true;if(activeScreen===me){if(localPlayback)executePlayback($('localMovie'),m.action);}else send(clients.get(activeScreen),{type:'localPlaybackCommand',action:m.action});}else if(movieState&&!browserState){executePlayback(ui.movie,m.action);syncMovie();}return true;}return false;}
-$('browserMode').onclick=()=>selectBrowser(true);$('videoMode').onclick=()=>selectBrowser(false);$('browserLocal').onclick=()=>{selectBrowser(false);chooseLocal();};$('browserShare').onclick=share;
+if(m.type==='browserRequest'){if(!(owner||permissions.browse)){if(!owner)send(clients.get(who),{type:'permissions',permissions});return true;}if(m.url===''){setBrowser('');return true;}const url=typeof m.url==='string'?browserURL(m.url):'';if(!url||activeScreen||pendingLocal||localPlayback)return true;const youtube=readYouTubeLink(url);if(youtube||isDirectVideo(url))loadMovie(url,youtube);else setBrowser(url);return true;}
+if(m.type==='playbackRequest'){if(!['play','pause'].includes(m.action))return true;const sourceOwn=activeScreen===who&&activeShareKind==='local';if(!(owner||permissions.playback||sourceOwn))return true;if(activeScreen){if(activeShareKind!=='local')return true;if(activeScreen===me){if(localPlayback)executePlayback($('localMovie'),m.action);}else send(clients.get(activeScreen),{type:'localPlaybackCommand',action:m.action});}else if(movieState&&!browserState){if(isYouTubeMovie())youtubePlayback(m.action);else{executePlayback(ui.movie,m.action);syncMovie();}}return true;}return false;}
+$('browserMode').onclick=()=>selectBrowser(true);$('videoMode').onclick=()=>selectBrowser(false);$('browserLocal').onclick=()=>{selectBrowser(false);chooseLocal();};$('browserShare').onclick=()=>share();$('browserShareTab').onclick=()=>share(true);$('youtubeShareTab').onclick=()=>share(true);
 $('browserForm').onsubmit=e=>{e.preventDefault();if(!canBrowse())return;const url=browserURL($('browserURL').value);if(!url){toast('Enter a valid external HTTPS website address.');return;}if(activeScreen||pendingLocal){toast('Stop the current share before browsing.');return;}toHost({type:'browserRequest',url});};
 $('browserReload').onclick=()=>{if(canBrowse()&&browserState)$('browserFrame').src=browserState;};
 $('browserClose').onclick=()=>{if(canBrowse())toHost({type:'browserRequest',url:''});};
 $('roomPlay').onclick=()=>toHost({type:'playbackRequest',action:'play'});$('roomPause').onclick=()=>toHost({type:'playbackRequest',action:'pause'});
 function validURL(v){try{const u=new URL(v);return u.protocol==='https:'&& !u.username&&!u.password?u.href:'';}catch{return '';}}
-function currentMovie(){if(!movieState?.url)return null;return {...movieState,time:ui.movie.currentTime||0,paused:ui.movie.paused,rate:ui.movie.playbackRate||1,at:Date.now()};}
-function syncMovie(){if(host&&!applying&&movieState&&movieState.url){movieState=currentMovie();broadcast({type:'movie',state:movieState});}}function loadMovie(url){if(browserState)setBrowser('');selectBrowser(false);movieState={url,time:0,paused:true,rate:1,at:Date.now()};ui.movie.src=url;ui.movie.controls=true;renderStage();syncMovie();play(ui.movie);}
-$('mediaForm').onsubmit=e=>{e.preventDefault();if(!host)return;const url=validURL($('mediaURL').value);if(!url){toast('Use a direct HTTPS video link.');return;}if(activeScreen){toast('Stop screen sharing before playing a video.');return;}if(localPlayback||pendingLocal){toast('Stop local playback first.');return;}loadMovie(url);};
-function applyMovie(state){if(host)return;if(state?.url&&browserState)applyBrowser('');if(!state?.url||!validURL(state.url)){movieState=null;ui.movie.pause();ui.movie.removeAttribute('src');ui.movie.load();renderStage();return;}const changed=movieState?.url!==state.url;movieState=state;applying=true;clearTimeout(applyTimer);if(changed){ui.movie.src=state.url;ui.movie.controls=false;}const adjust=()=>{if(movieState!==state)return;const lag=state.paused?0:Math.min(5,Math.max(0,(Date.now()-Number(state.at||Date.now()))/1000));const target=Math.max(0,Number(state.time||0)+lag*Number(state.rate||1));if(Number.isFinite(target)&&Math.abs(ui.movie.currentTime-target)>.65)try{ui.movie.currentTime=target;}catch{}ui.movie.playbackRate=Math.min(2,Math.max(.5,Number(state.rate)||1));if(state.paused||activeScreen)ui.movie.pause();else ui.movie.play().catch(()=>notice('Tap the video to allow playback.'));};if(ui.movie.readyState>=1)adjust();else ui.movie.addEventListener('loadedmetadata',adjust,{once:true});applyTimer=setTimeout(()=>applying=false,800);renderStage();}
-for(const event of ['play','pause','seeked','ratechange','ended'])ui.movie.addEventListener(event,syncMovie);setInterval(()=>{if(host&&joined&&movieState?.url&&!ui.movie.paused)syncMovie();},3000);ui.movie.onclick=()=>{if(!host&&movieState&&!movieState.paused)play(ui.movie);};ui.movie.onerror=()=>notice('Video could not load. Use a direct MP4/WebM link or screen sharing.');$('movieVolume').oninput=()=>{ui.movie.volume=Number($('movieVolume').value);ui.screen.volume=Number($('movieVolume').value);$('localMovie').volume=Number($('movieVolume').value);};$('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen?.();else if($('stage').requestFullscreen)$('stage').requestFullscreen().catch(()=>toast('Fullscreen unavailable'));else if(!$('localMovie').hidden)$('localMovie').webkitEnterFullscreen?.();else if(!ui.movie.hidden)ui.movie.webkitEnterFullscreen?.();else if(!ui.screen.hidden)ui.screen.webkitEnterFullscreen?.();};
+function normalizeSourceURL(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw.length > 2048 || /\s/.test(raw)) return '';
+  const address = /^[\w-]+(?:\.[\w-]+)+(?:[:/?#]|$)/.test(raw) ? 'https://' + raw : raw;
+  return validURL(address.replace(/^http:\/\//i, 'https://'));
+}
+
+function readYouTubeLink(url) {
+  if (!url) return null;
+  const parsed = new URL(url);
+  const name = parsed.hostname.toLowerCase();
+  const [, section, item] = parsed.pathname.split('/');
+  let id;
+  if (name === 'youtu.be' || name === 'www.youtu.be') id = section;
+  else if (['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(name)) {
+    if (section === 'watch') id = parsed.searchParams.get('v');
+    else if (['shorts', 'live', 'embed', 'v'].includes(section)) id = item;
+  } else if (['youtube-nocookie.com', 'www.youtube-nocookie.com'].includes(name) && section === 'embed') {
+    id = item;
+  }
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id || '')) return null;
+  const timestamp = parsed.searchParams.get('t') ?? parsed.searchParams.get('start') ??
+    new URLSearchParams(parsed.hash.slice(1)).get('t') ?? '';
+  const parts = timestamp.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+  const seconds = /^\d+$/.test(timestamp) ? Number(timestamp) :
+    parts ? Number(parts[1] || 0) * 3600 + Number(parts[2] || 0) * 60 + Number(parts[3] || 0) : 0;
+  return {id, time: Math.min(seconds || 0, 86400), url: 'https://www.youtube.com/watch?v=' + id};
+}
+
+function isDirectVideo(url) {
+  return /\.(mp4|webm|m4v|ogv)$/i.test(new URL(url).pathname);
+}
+
+let youtubeSession = null;
+let youtubeAPI = null;
+const youtubeStage = $('youtubeStage');
+const youtubeTools = $('youtubeTools');
+const youtubeMessage = $('youtubeMessage');
+let youtubeVisible = false;
+const youtubeObserver = new IntersectionObserver(([entry]) => {
+  youtubeVisible = entry.intersectionRatio > .5;
+  applyYouTubePlayback();
+}, {threshold: [.5, .51]});
+youtubeObserver.observe(youtubeStage);
+document.addEventListener('visibilitychange', applyYouTubePlayback);
+
+function isYouTubeMovie() { return movieState?.kind === 'youtube'; }
+
+function getYouTubeAPI() {
+  if (window.YT?.Player) return Promise.resolve(window.YT);
+  if (youtubeAPI) return youtubeAPI;
+  youtubeAPI = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    const fail = () => {
+      clearTimeout(timer);
+      script.remove();
+      reject(Error('The YouTube player did not load.'));
+    };
+    const timer = setTimeout(fail, 12000);
+    window.onYouTubeIframeAPIReady = () => {
+      clearTimeout(timer);
+      if (window.YT?.Player) resolve(window.YT);
+      else fail();
+    };
+    script.src = 'https://www.youtube.com/iframe_api';
+    script.async = true;
+    script.onerror = fail;
+    document.head.append(script);
+  }).catch(error => {
+    youtubeAPI = null;
+    throw error;
+  });
+  return youtubeAPI;
+}
+
+function setYouTubeMessage(text, enableLocalPlay = false) {
+  youtubeMessage.textContent = text;
+  $('youtubeStart').hidden = !enableLocalPlay;
+}
+
+function clearMovieElement() {
+  if (youtubeSession) {
+    const session = youtubeSession;
+    youtubeSession = null;
+    clearTimeout(session.timeout);
+    session.player?.destroy();
+    youtubeStage.replaceChildren();
+  }
+  if (ui.movie.hasAttribute('src')) {
+    ui.movie.pause();
+    ui.movie.removeAttribute('src');
+    ui.movie.load();
+  }
+}
+
+function clearMovie() {
+  movieState = null;
+  clearMovieElement();
+  renderStage();
+}
+
+function updateYouTubeStage(visible) {
+  youtubeStage.hidden = !visible;
+  youtubeTools.hidden = !visible;
+  $('fullscreen').hidden = visible;
+  if (!visible && youtubeSession?.ready) {
+    const state = youtubeSession.player.getPlayerState();
+    if (state === 1 || state === 3) youtubeSession.player.pauseVideo();
+  }
+}
+
+function mountYouTube(state) {
+  const session = {id: state.id, ready: false, player: null, autoplayBlocked: false, timeout: null};
+  youtubeSession = session;
+  $('youtubeExternal').href = state.url;
+  setYouTubeMessage('Loading YouTube…');
+
+  const fail = message => {
+    if (youtubeSession !== session) return;
+    clearTimeout(session.timeout);
+    setYouTubeMessage(message + ' Open it on YouTube, then share that tab if you can play it there.');
+  };
+
+  getYouTubeAPI().then(YT => {
+    if (youtubeSession !== session || leaving) return;
+    const iframe = document.createElement('iframe');
+    const embed = new URL('https://www.youtube.com/embed/' + state.id);
+    embed.searchParams.set('enablejsapi', '1');
+    embed.searchParams.set('origin', location.origin);
+    embed.searchParams.set('playsinline', '1');
+    if (state.time > 0) embed.searchParams.set('start', String(Math.floor(state.time)));
+    iframe.title = 'YouTube video player';
+    iframe.referrerPolicy = 'strict-origin-when-cross-origin';
+    iframe.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+    iframe.allowFullscreen = true;
+    iframe.src = embed.href;
+    youtubeStage.replaceChildren(iframe);
+    session.timeout = setTimeout(() => fail('The YouTube player did not respond.'), 20000);
+    session.player = new YT.Player(iframe, {events: {
+      onReady(event) {
+        if (youtubeSession !== session) return;
+        clearTimeout(session.timeout);
+        session.player = event.target;
+        session.ready = true;
+        event.target.setVolume(Number($('movieVolume').value) * 100);
+        setYouTubeMessage(host ? 'Play or pause to control the room.' : 'Following the room’s playback.');
+        if (!host) applyYouTubePlayback();
+      },
+      onStateChange(event) {
+        if (youtubeSession !== session || !session.ready) return;
+        if (event.data === 1) {
+          session.autoplayBlocked = false;
+          setYouTubeMessage(host ? 'Playing for the room.' : 'Following the room’s playback.');
+          if (youtubeStage.hidden) { event.target.pauseVideo(); return; }
+        }
+        if (host && [0, 1, 2, 3].includes(event.data)) syncMovie();
+        if (!host && event.data === 2 && movieState?.paused) applyYouTubePlayback();
+      },
+      onPlaybackRateChange() { if (host && youtubeSession === session) syncMovie(); },
+      onAutoplayBlocked() {
+        if (youtubeSession !== session) return;
+        session.autoplayBlocked = true;
+        setYouTubeMessage('Tap Play here to start on this device.', true);
+      },
+      onError(event) {
+        if (youtubeSession !== session) return;
+        session.ready = false;
+        if ([101, 150].includes(event.data)) fail('This video’s owner has disabled embedded playback.');
+        else if (event.data === 100) fail('This video is unavailable.');
+        else fail('YouTube could not play this video here.');
+      }
+    }});
+  }).catch(error => fail(error.message));
+}
+
+function youtubePlayback(action) {
+  const session = youtubeSession;
+  if (!session?.ready || youtubeStage.hidden) return;
+  if (action === 'pause') session.player.pauseVideo();
+  else {
+    session.autoplayBlocked = false;
+    session.player.playVideo();
+  }
+}
+
+function movieTime(state) {
+  const delay = state.paused ? 0 : Math.min(5, Math.max(0, (Date.now() - state.at) / 1000));
+  return state.time + delay * state.rate;
+}
+
+function applyYouTubePlayback() {
+  const session = youtubeSession;
+  if (host || !isYouTubeMovie() || !session?.ready || youtubeStage.hidden) return;
+  const player = session.player;
+  const phase = player.getPlayerState();
+  if (player.getPlaybackRate() !== movieState.rate) player.setPlaybackRate(movieState.rate);
+  if (movieState.paused) {
+    if (phase === 1 || phase === 3) player.pauseVideo();
+    // A paused seek can start playback when the iframe has only cued the video.
+    if (phase === 2 && Math.abs(player.getCurrentTime() - movieState.time) > .6) {
+      player.seekTo(movieState.time, true);
+    }
+    return;
+  }
+  if (document.hidden || !youtubeVisible || session.autoplayBlocked) return;
+  const target = movieTime(movieState);
+  if (phase !== 3 && Math.abs(player.getCurrentTime() - target) > 1.25) player.seekTo(target, true);
+  if (phase !== 1 && phase !== 3) player.playVideo();
+}
+
+function currentMovie() {
+  if (!movieState) return null;
+  if (isYouTubeMovie()) {
+    if (!youtubeSession?.ready) return movieState;
+    const player = youtubeSession.player;
+    const phase = player.getPlayerState();
+    const position = player.getCurrentTime();
+    const time = Number.isFinite(position) && (position || ![-1, 5].includes(phase)) ? position : movieState.time;
+    return {...movieState, time, rate: player.getPlaybackRate() || 1,
+      paused: phase === 3 ? movieState.paused : phase !== 1, at: Date.now()};
+  }
+  return {...movieState, time: ui.movie.currentTime || 0, paused: ui.movie.paused,
+    rate: ui.movie.playbackRate || 1, at: Date.now()};
+}
+
+function syncMovie() {
+  if (!host || applying || !movieState) return;
+  movieState = currentMovie();
+  broadcast({type: 'movie', state: movieState});
+}
+
+function loadMovie(url, youtube = readYouTubeLink(url)) {
+  if (browserState) setBrowser('');
+  clearMovie();
+  selectBrowser(false);
+  $('mediaURL').value = url;
+  movieState = youtube ? {...youtube, kind: 'youtube', paused: true, rate: 1, at: Date.now()} :
+    {url, time: 0, paused: true, rate: 1, at: Date.now()};
+  if (youtube) mountYouTube(movieState);
+  else {
+    ui.movie.src = url;
+    ui.movie.controls = true;
+    play(ui.movie);
+  }
+  renderStage();
+  syncMovie();
+}
+
+$('mediaForm').onsubmit = event => {
+  event.preventDefault();
+  if (!host) return;
+  const url = normalizeSourceURL($('mediaURL').value);
+  if (!url) { toast('Paste a YouTube video or a direct HTTPS video link.'); return; }
+  const youtube = readYouTubeLink(url);
+  if (!youtube && /^(?:www\.|m\.|music\.)?youtube\.com$/.test(new URL(url).hostname)) {
+    toast('Paste a link to an individual YouTube video.');
+    return;
+  }
+  if (activeScreen || localScreen || localPlayback || pendingLocal) {
+    toast('Stop the current share before loading a video.');
+    return;
+  }
+  loadMovie(url, youtube);
+};
+
+function applyMovie(raw) {
+  if (host) return;
+  const url = validURL(raw?.url);
+  const youtube = raw?.kind === 'youtube' ? readYouTubeLink(url) : null;
+  if (!url || (raw?.kind === 'youtube' && !youtube)) { clearMovie(); return; }
+  if (browserState) applyBrowser('');
+  const time = Number(raw.time);
+  const at = Number(raw.at);
+  const state = {url, time: Number.isFinite(time) ? Math.max(0, time) : 0, paused: raw.paused !== false,
+    rate: Math.min(2, Math.max(.25, Number(raw.rate) || 1)), at: Number.isFinite(at) ? at : Date.now()};
+  const changed = movieState?.url !== url || isYouTubeMovie() !== !!youtube;
+  if (changed) clearMovieElement();
+  movieState = youtube ? {...state, kind: 'youtube', id: youtube.id} : state;
+  if (changed) {
+    selectBrowser(false);
+    if (youtube) mountYouTube(movieState);
+    else {
+      ui.movie.src = url;
+      ui.movie.controls = false;
+    }
+  }
+  renderStage();
+  if (youtube) { applyYouTubePlayback(); return; }
+  applying = true;
+  clearTimeout(applyTimer);
+  const adjust = () => {
+    if (movieState !== state) return;
+    const target = movieTime(state);
+    if (Math.abs(ui.movie.currentTime - target) > .65) try { ui.movie.currentTime = target; } catch {}
+    ui.movie.playbackRate = Math.max(.5, state.rate);
+    if (state.paused || activeScreen) ui.movie.pause();
+    else ui.movie.play().catch(() => notice('Tap the video to allow playback.'));
+  };
+  if (ui.movie.readyState >= 1) adjust();
+  else ui.movie.addEventListener('loadedmetadata', adjust, {once: true});
+  applyTimer = setTimeout(() => applying = false, 800);
+}
+
+for (const event of ['play', 'pause', 'seeked', 'ratechange', 'ended']) {
+  ui.movie.addEventListener(event, () => { if (!isYouTubeMovie()) syncMovie(); });
+}
+setInterval(() => {
+  if (host && joined && (isYouTubeMovie() || (movieState && !ui.movie.paused))) syncMovie();
+}, 3000);
+$('youtubeStart').onclick = () => {
+  youtubePlayback('play');
+  if (!host) applyYouTubePlayback();
+};
+ui.movie.onclick = () => { if (!host && movieState && !movieState.paused) play(ui.movie); };
+ui.movie.onerror = () => notice('This video could not load. Try a direct MP4 or WebM file, or open the source in a tab and share it.');
+$('movieVolume').oninput = () => {
+  const volume = Number($('movieVolume').value);
+  ui.movie.volume = ui.screen.volume = $('localMovie').volume = volume;
+  if (youtubeSession?.ready) youtubeSession.player.setVolume(volume * 100);
+};
+$('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen?.();else if($('stage').requestFullscreen)$('stage').requestFullscreen().catch(()=>toast('Fullscreen unavailable'));else if(!$('localMovie').hidden)$('localMovie').webkitEnterFullscreen?.();else if(!ui.movie.hidden)ui.movie.webkitEnterFullscreen?.();else if(!ui.screen.hidden)ui.screen.webkitEnterFullscreen?.();};
 $('leave').onclick=()=>{leaving=true;stopShare(false);localAV.getTracks().forEach(t=>t.stop());clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installFrame(){if(standalone()){toast('Frame is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Frame.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Frame.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installFrame;installHelp.onclick=installFrame;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
