@@ -1,13 +1,13 @@
 # Erev
 
-An approval-only web watch party hosted at [erev.pages.dev](https://erev.pages.dev/). The signup and approval workflow uses Google OpenID Connect and Cloudflare D1. Resend delivers an email when a host operator approves a request.
+An approval-only web watch party hosted at [erev.pages.dev](https://erev.pages.dev/). The approval workflow uses Cloudflare D1 and supports email sign-in with Resend or Google OpenID Connect. Resend sends sign-in links and approval confirmations.
 
 ## Cloudflare deployment
 
-1. Create the D1 database and apply `beta/schema.sql`. Bind it as `DB` in the Pages production environment.
+1. Create the D1 database and apply `beta/schema.sql` and `beta/email-sign-in.sql`. Bind it as `DB` in the Pages production environment.
 2. Set `PUBLIC_ORIGIN` to the canonical HTTPS origin, with no trailing slash. Set `ADMIN_EMAIL` to the owner's Gmail address.
-3. Create a Google web OAuth client and authorize `https://erev.pages.dev/auth/google/callback` as its redirect URI. Configure `GOOGLE_CLIENT_ID` and the encrypted `GOOGLE_CLIENT_SECRET` in Pages.
-4. Verify a sending domain in Resend. Set `RESEND_FROM` to an address on that domain and store a sending-only `RESEND_API_KEY` as a Pages secret.
+3. For optional Google sign-in, create a Google web OAuth client and authorize `https://erev.pages.dev/auth/google/callback` as its redirect URI. Configure `GOOGLE_CLIENT_ID` and the encrypted `GOOGLE_CLIENT_SECRET` in Pages.
+4. For email sign-in and approval confirmations, verify a sending domain in Resend. Turn off link tracking for the sending domain. Set `RESEND_FROM` to an address on that domain and store a sending-only `RESEND_API_KEY` as a Pages secret.
 5. Run `node beta/build.mjs` from a checkout to produce `dist/_worker.js`. Deploy the output to the existing Pages project with its production bindings. The app retains on-screen approval status when email delivery needs a retry.
 
 GitHub Pages redirects visitors to the Cloudflare site. The app is served only to approved Erev accounts. Private room invitations issued before the beta are replaced by new beta invitations.

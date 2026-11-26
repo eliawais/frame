@@ -60,7 +60,7 @@ function page(title, body, status = 200) {
     escape(title) + ' | Erev</title><link rel="icon" href="/icon.svg"><style>' +
     ':root{color-scheme:dark;background:#141515;color:#f5eedc;font:16px system-ui,sans-serif}body{margin:0}main{max-width:48rem;margin:12vh auto;padding:2rem}' +
     'a{color:#c4e972}header{display:flex;align-items:center;gap:.55rem;font-size:1.5rem;font-weight:800}header img{width:2rem;height:2rem}h1{margin:1.25rem 0 .5rem;font-size:clamp(2rem,5vw,3rem)}p{color:#c8c9c0;line-height:1.55}' +
-    'button,.button{display:inline-block;background:#c4e972;color:#18200d;border:0;border-radius:.55rem;font:inherit;font-weight:700;padding:.65rem .8rem;cursor:pointer;text-decoration:none}button.secondary{background:#30332d;color:#f5eedc}' +
+    'button,.button{display:inline-block;background:#c4e972;color:#18200d;border:0;border-radius:.55rem;font:inherit;font-weight:700;padding:.65rem .8rem;cursor:pointer;text-decoration:none}button.secondary{background:#30332d;color:#f5eedc}label[for=email-address]{display:block;margin-bottom:.4rem}input[type=email]{border:1px solid #555b4c;border-radius:.55rem;padding:.65rem .8rem;font:inherit;margin:0 .45rem .65rem 0;max-width:90%}' +
     'table{width:100%;border-collapse:collapse;margin:1.3rem 0}th,td{padding:.6rem .35rem;text-align:left;border-bottom:1px solid #383b33;overflow-wrap:anywhere}td form{display:inline-block;margin:.18rem 0}small{color:#c8c9c0}@media(max-width:560px){main{margin-top:6vh;padding:1rem}th,td{font-size:.82rem}}</style>' +
     '<main><header><img src="/icon.svg" alt="">erev.</header><h1>' + escape(title) + "</h1>" + body + "</main></html>",
     { status, headers: out }
@@ -68,12 +68,27 @@ function page(title, body, status = 200) {
 }
 
 const logoutForm = '<form action="/auth/logout" method="post"><button class="secondary">Sign out</button></form>';
-const signInForm = '<a class="button" id="google-sign-in" href="/auth/google">Continue with Google</a><script src="/beta-invite.js" defer></script>';
+const googleForm = '<a class="button" id="google-sign-in" href="/auth/google">Continue with Google</a>';
+const emailForm = '<form action="/auth/email" method="post"><label for="email-address">Email address</label>' +
+  '<input type="email" id="email-address" name="email" autocomplete="email" maxlength="254" required>' +
+  '<input type="hidden" name="invite" id="email-invite"><button>Send sign-in link</button></form>';
+const browserScript = '<script src="/beta-invite.js" defer></script>';
 
-function signInPage(configured, error = false) {
+function emailConfigured(env) {
+  return Boolean(env.RESEND_API_KEY && env.RESEND_FROM);
+}
+
+function googleConfigured(env) {
+  return Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+}
+
+function signInPage(env, error = false) {
+  const email = emailConfigured(env);
+  const google = googleConfigured(env);
   return page("Request access to Erev", '<p>Movie nights for friends, wherever you are. Erev is an approval-only beta.</p>' +
-    (configured ? (error ? '<p>Google sign-in didn’t finish. Try again.</p>' : '') + signInForm :
-      '<p>Signups will open once Google sign-in is set up.</p><script src="/beta-invite.js" defer></script>'));
+    (error ? '<p>Sign-in didn’t finish. Try again.</p>' : "") +
+    (email ? emailForm : "") + (google ? googleForm : "") +
+    (!email && !google ? '<p>Signups will open once sign-in is set up.</p>' : "") + browserScript);
 }
 
 function accountStatus(user) {
@@ -99,7 +114,7 @@ function isAdmin(user, env) {
 }
 
 async function googleStart(url, env) {
-  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return signInPage(false);
+  if (!googleConfigured(env)) return signInPage(env);
   const now = Date.now();
   const state = randomToken();
   const verifier = randomToken();
@@ -159,18 +174,113 @@ async function googleCallback(request, url, env) {
   const email = profile.email.toLowerCase();
   const label = (typeof profile.name === "string" ? profile.name.trim() : "").slice(0, 80) || email;
   const admin = email.endsWith("@gmail.com") && email === env.ADMIN_EMAIL?.toLowerCase();
+  return await startSession(env, { id: profile.sub, email, label, admin, invite: attempt.invite }, [clear]);
+}
+
+async function startSession(env, { id, email, label, admin, invite }, cookies = []) {
+  const now = Date.now();
   const session = randomToken();
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO users (id, email, name, status, created_at) VALUES (?, ?, ?, ?, ?) " +
       "ON CONFLICT(id) DO UPDATE SET email=excluded.email, name=excluded.name, " +
       "status=CASE WHEN excluded.status='approved' THEN 'approved' ELSE users.status END"
-    ).bind(profile.sub, email, label, admin ? "approved" : "pending", now),
+    ).bind(id, email, label, admin ? "approved" : "pending", now),
     env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now),
     env.DB.prepare("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
-      .bind(await digest(session), profile.sub, now + 7 * day),
+      .bind(await digest(session), id, now + 7 * day),
   ]);
-  return redirect("/" + (attempt.invite ? "#" + attempt.invite : ""), [clear, cookie(sessionCookie, session, 7 * 86400)]);
+  return redirect("/" + (invite ? "#" + invite : ""), [...cookies, cookie(sessionCookie, session, 7 * 86400)]);
+}
+
+async function sendEmail(env, { to, subject, text, key }) {
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        Authorization: "Bearer " + env.RESEND_API_KEY,
+        "Content-Type": "application/json",
+        "Idempotency-Key": key,
+      },
+      body: JSON.stringify({ from: env.RESEND_FROM, to: [to], subject, text }),
+    });
+    return response.ok ? await response.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function takeSendSlot(db, bucket, window, limit, now) {
+  const start = Math.floor(now / window) * window;
+  return db.prepare(
+    "INSERT INTO email_rate_limits (bucket, count, expires_at) VALUES (?, 1, ?) " +
+    "ON CONFLICT(bucket) DO UPDATE SET count=count+1 WHERE count < ? RETURNING count"
+  ).bind(bucket + ":" + start, start + window, limit).first();
+}
+
+async function emailStart(request, env) {
+  if (!emailConfigured(env)) return signInPage(env);
+  const form = await request.formData();
+  const address = form.get("email");
+  const email = typeof address === "string" ? address.trim().toLowerCase() : "";
+  if (email.length > 254 || !/^[a-z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(email)) {
+    return page("Check your email address", '<p><a href="/">Try again</a></p>', 400);
+  }
+  const invite = form.get("invite");
+  const now = Date.now();
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  if (!await takeSendSlot(env.DB, "email:" + await digest(email), 3_600_000, 3, now) ||
+      !await takeSendSlot(env.DB, "ip:" + await digest(ip), 3_600_000, 12, now) ||
+      !await takeSendSlot(env.DB, "daily", day, 60, now)) {
+    return page("Try again later", '<p>Sign-in links are temporarily limited. <a href="/">Return to Erev</a>.</p>', 429);
+  }
+  const token = randomToken();
+  const hash = await digest(token);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM email_rate_limits WHERE expires_at <= ?").bind(now),
+    env.DB.prepare("DELETE FROM email_challenges WHERE expires_at <= ?").bind(now),
+    env.DB.prepare("INSERT INTO email_challenges (token_hash, email, invite, expires_at) VALUES (?, ?, ?, ?)")
+      .bind(hash, email, typeof invite === "string" && invitePattern.test(invite) ? invite : "", now + 900_000),
+  ]);
+  const sent = await sendEmail(env, {
+    to: email,
+    subject: "Your Erev sign-in link",
+    text: "Sign in to the Erev beta:\n\n" + env.PUBLIC_ORIGIN + "/auth/email/verify#" + token +
+      "\n\nThis single-use link expires in 15 minutes. If you didn’t request it, you can ignore this email.",
+    key: "erev-sign-in/" + hash,
+  });
+  if (!sent) {
+    await env.DB.prepare("DELETE FROM email_challenges WHERE token_hash=?").bind(hash).run();
+    return page("Email couldn't be sent", '<p>Try again in a few minutes. <a href="/">Return to Erev</a>.</p>', 503);
+  }
+  return page("Check your inbox", '<p>Open the sign-in link in your Erev email. It expires in 15 minutes.</p><p><a href="/">Back to Erev</a></p>');
+}
+
+function emailConfirmation(env) {
+  if (!emailConfigured(env)) return signInPage(env);
+  return page("Sign in to Erev", '<p>Continue to verify your email address and sign in.</p>' +
+    '<form method="post" action="/auth/email/verify"><input type="hidden" name="token" id="email-token">' +
+    '<button id="verify-email" disabled>Verify and sign in</button></form>' +
+    '<p><a href="/">Request a new link</a></p>' + browserScript);
+}
+
+async function verifyEmail(request, env) {
+  if (!emailConfigured(env)) return signInPage(env);
+  const token = (await request.formData()).get("token");
+  if (typeof token !== "string" || !opaquePattern.test(token)) return redirect("/?sign-in-error=1");
+  const attempt = await env.DB.prepare(
+    "DELETE FROM email_challenges WHERE token_hash = ? AND expires_at > ? RETURNING email, invite"
+  ).bind(await digest(token), Date.now()).first();
+  if (!attempt) return page("Sign-in link expired or used", '<p><a href="/">Request a new link</a></p>', 400);
+  const { email, invite } = attempt;
+  return await startSession(env, {
+    id: "email:" + email,
+    email,
+    label: email.split("@", 1)[0].slice(0, 80),
+    admin: email === env.ADMIN_EMAIL?.toLowerCase(),
+    invite,
+  });
 }
 
 async function adminPage(env, notice) {
@@ -212,28 +322,14 @@ async function sendApproval(env, userId) {
   if (item.first_attempt_at && now - item.first_attempt_at > 23 * 60 * 60_000) return false;
   await env.DB.prepare("UPDATE approval_emails SET first_attempt_at=COALESCE(first_attempt_at,?) WHERE id=?")
     .bind(now, item.id).run();
-  let response;
-  try {
-    response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + env.RESEND_API_KEY,
-        "Content-Type": "application/json",
-        "Idempotency-Key": "erev-approval/" + item.id,
-      },
-      body: JSON.stringify({
-        from: env.RESEND_FROM,
-        to: [item.email],
-        subject: "Your Erev access is approved",
-        text: "You’re approved to join the Erev beta.\n\nOpen " + env.PUBLIC_ORIGIN +
-          "/ and sign in with the same Google account to create or join a room.\n\nSee you at movie night,\nErev",
-      }),
-    });
-  } catch {
-    return false;
-  }
-  if (!response.ok) return false;
-  const sent = await response.json();
+  const sent = await sendEmail(env, {
+    to: item.email,
+    subject: "Your Erev access is approved",
+    text: "You’re approved to join the Erev beta.\n\nOpen " + env.PUBLIC_ORIGIN +
+      "/ and sign in with the same email address to create or join a room.\n\nSee you at movie night,\nErev",
+    key: "erev-approval/" + item.id,
+  });
+  if (!sent) return false;
   await env.DB.prepare("UPDATE approval_emails SET sent_at=?, provider_id=? WHERE id=?")
     .bind(Date.now(), sent.id || null, item.id).run();
   return true;
@@ -287,7 +383,12 @@ async function roomAccess(request, env) {
   return room ? json({ signalingCode: room.signaling_code }) : json({ error: "Room not found. Ask the host for a current invite." }, 404);
 }
 
-const browserHelper = "const link=document.getElementById('google-sign-in');const invite=location.hash.slice(1)||new URL(location.href).searchParams.get('room');if(link&&invite)link.search=new URLSearchParams({invite});if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});";
+const browserHelper = "const hash=location.hash.slice(1);const token=document.getElementById('email-token');" +
+  "if(token){if(/^[A-Za-z0-9_-]{43}$/.test(hash)){token.value=hash;document.getElementById('verify-email').disabled=false;}" +
+  "if(hash)history.replaceState(null,'',location.pathname);}" +
+  "else{const invite=hash||new URL(location.href).searchParams.get('room');const field=document.getElementById('email-invite');" +
+  "const link=document.getElementById('google-sign-in');if(invite){if(field)field.value=invite;if(link)link.search=new URLSearchParams({invite});}}" +
+  "if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});";
 const publicAssets = new Set(["/icon.svg", "/icon-maskable.svg", "/sw.js", "/manifest.webmanifest"]);
 
 export function handler(files) {
@@ -318,6 +419,11 @@ export function handler(files) {
         if (!env.DB) return page("Erev beta", "<p>Signups are being set up.</p>", 503);
         if (method === "GET" && path === "/auth/google") return await googleStart(url, env);
         if (method === "GET" && path === "/auth/google/callback") return await googleCallback(request, url, env);
+        if (method === "POST" && path === "/auth/email") return await emailStart(request, env);
+        if (path === "/auth/email/verify") {
+          if (method === "GET") return emailConfirmation(env);
+          if (method === "POST") return await verifyEmail(request, env);
+        }
         if (method === "POST" && path === "/auth/logout") {
           const token = readCookie(request, sessionCookie);
           if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await digest(token)).run();
@@ -346,7 +452,7 @@ export function handler(files) {
         }
         if (method === "POST") return json({ error: "Not found" }, 404);
         if (path === "/" || path === "/index.html") {
-          if (!user) return signInPage(Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET), url.searchParams.has("sign-in-error"));
+          if (!user) return signInPage(env, url.searchParams.has("sign-in-error"));
           if (user.status !== "approved") return accountStatus(user);
         }
         if (!asset) return json({ error: "Not found" }, 404);
