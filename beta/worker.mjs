@@ -113,13 +113,25 @@ function isAdmin(user, env) {
   return user.email.toLowerCase() === env.ADMIN_EMAIL?.toLowerCase();
 }
 
+function adminSignInPage(user, env) {
+  const intro = user
+    ? "<p>You’re signed in as " + escape(user.email) + ". To manage the beta, switch to your Erev admin account.</p>"
+    : "<p>Sign in with your Erev admin account to manage beta access.</p>";
+  const action = googleConfigured(env)
+    ? '<p><a class="button" href="/auth/google?next=admin">Choose Google account</a></p>'
+    : "";
+  return page(user ? "Admin access required" : "Sign in to manage Erev",
+    intro + action + '<p><a href="/">Back to Erev</a></p>', user ? 403 : 401);
+}
+
 async function googleStart(url, env) {
   if (!googleConfigured(env)) return signInPage(env);
   const now = Date.now();
   const state = randomToken();
   const verifier = randomToken();
   const value = url.searchParams.get("invite") || "";
-  const invite = invitePattern.test(value) ? value : "";
+  const adminRequested = url.searchParams.get("next") === "admin";
+  const invite = adminRequested ? "/admin" : (invitePattern.test(value) ? value : "");
   await env.DB.batch([
     env.DB.prepare("DELETE FROM sign_in_attempts WHERE expires_at <= ?").bind(now),
     env.DB.prepare("INSERT INTO sign_in_attempts (state_hash, verifier, invite, expires_at) VALUES (?, ?, ?, ?)")
@@ -134,6 +146,7 @@ async function googleStart(url, env) {
     code_challenge_method: "S256",
     state,
   });
+  if (adminRequested) query.set("prompt", "select_account");
   return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + query, [cookie(stateCookie, state, 600)]);
 }
 
@@ -190,7 +203,8 @@ async function startSession(env, { id, email, label, admin, invite }, cookies = 
     env.DB.prepare("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
       .bind(await digest(session), id, now + 7 * day),
   ]);
-  return redirect("/" + (invite ? "#" + invite : ""), [...cookies, cookie(sessionCookie, session, 7 * 86400)]);
+  const destination = invite === "/admin" ? "/admin" : "/" + (invite ? "#" + invite : "");
+  return redirect(destination, [...cookies, cookie(sessionCookie, session, 7 * 86400)]);
 }
 
 async function sendEmail(env, { to, subject, text, key }) {
@@ -435,10 +449,13 @@ export function handler(files) {
           return page("Your account", "<p>Signed in as " + escape(user.email) + '.</p><p><a href="/">Open Erev</a>' +
             (isAdmin(user, env) ? ' · <a href="/admin">Manage beta access</a>' : "") + "</p>" + logoutForm);
         }
-        if (path === "/admin" || path === "/admin/access") {
+        if (path === "/admin" && method === "GET") {
+          if (!isAdmin(user, env)) return adminSignInPage(user, env);
+          return await adminPage(env, url.searchParams.get("done"));
+        }
+        if (path === "/admin/access" && method === "POST") {
           if (!isAdmin(user, env)) return json({ error: "Forbidden" }, 403);
-          if (path === "/admin" && method === "GET") return await adminPage(env, url.searchParams.get("done"));
-          if (path === "/admin/access" && method === "POST") return await changeAccess(request, env, user);
+          return await changeAccess(request, env, user);
         }
         if (path.startsWith("/api/")) {
           if (!user) return json({ error: "Sign in to use Erev." }, 401);
