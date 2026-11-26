@@ -2,16 +2,104 @@
 const $=id=>document.getElementById(id), ui={landing:$('landing'),room:$('room'),status:$('status'),notice:$('notice'),movie:$('movie'),screen:$('screenVideo')};
 const MAX=6, prefix='frame-v1-', tokenRE=/^(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;let permissions={playback:false,browse:false},browserState='',browserSelected=false,activeShareKind='screen';let peer,roomKey='',roomSlug='',me='',name='',host=false,up=null,roster=new Map(),clients=new Map(),out=new Map(),incoming=new Map(),streams=new Map(),volumes=new Map(),localAV=new MediaStream(),localScreen=null,activeScreen='',movieState=null,applying=false,applyTimer,toastTimer,localURL='',localPlayback=false,pendingLocal=false,joined=false,leaving=false;
 let voiceMode=false,voiceContext=null,voiceInput=null,voiceProcessor=null,voiceSilent=null,voiceTrack=null,voiceNeedsTap=false;const voiceQueue=new Map(),voiceGains=new Map(),voiceSources=new Set(),voiceRate=new Map(),voiceLast=new Map(),voiceRequestAt=new Map();const retryAttempts=new Map(), retryTimers=new Map(), lastMediaRequest=new Map();let networkWatch=null, screenRequestAt=0, autoplayBlocked=false, screenWaitAt=0;
-const DEFAULT_ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun.cloudflare.com:3478']},{urls:['turn:eu-0.turn.peerjs.com:3478','turn:us-0.turn.peerjs.com:3478'],username:'peerjs',credential:'peerjsp'}];
-function parseRelay(raw){if(!raw.trim())return [];const a=JSON.parse(raw);if(!Array.isArray(a)||a.length>8)throw Error('Expected an array of up to 8 ICE servers.');return a.map(x=>{const urls=Array.isArray(x?.urls)?x.urls:[x?.urls];if(!urls.length||urls.length>8||urls.some(u=>typeof u!=='string'||u.length>250||!/^(stun|stuns|turn|turns):[^\s]+$/i.test(u)))throw Error('Invalid ICE server URL.');const needs=urls.some(u=>/^turns?:/i.test(u));if(needs&&(typeof x.username!=='string'||!x.username||typeof x.credential!=='string'||!x.credential))throw Error('TURN requires a username and temporary credential.');return needs?{urls,username:x.username,credential:x.credential}:{urls};});}
-function savedRelay(){try{return parseRelay(sessionStorage.getItem('frame-turn')||'');}catch{return [];}}
-function iceConfig(){return {iceServers:[...DEFAULT_ICE,...savedRelay()],iceTransportPolicy:'all',sdpSemantics:'unified-plan',iceCandidatePoolSize:0};}
-function networkText(s){$('networkInfo').textContent=s;}
-function relayLabel(){return savedRelay().some(s=>s.urls.some(u=>/^turns?:/i.test(u)))?'Custom TURN configured. Direct connections are still preferred.':'Automatic connection with public relay fallback. Dedicated TURN not configured.';}
-try{$('relayConfig').value=sessionStorage.getItem('frame-turn')||'';}catch{}
-networkText(relayLabel());$('networkToggle').onclick=()=>{const p=$('networkPanel');p.hidden=!p.hidden;$('networkToggle').setAttribute('aria-expanded',String(!p.hidden));};
-$('relaySave').onclick=()=>{try{const raw=$('relayConfig').value.trim();parseRelay(raw);if(raw)sessionStorage.setItem('frame-turn',raw);else sessionStorage.removeItem('frame-turn');networkText(relayLabel());toast(joined?'Saved. Leave and rejoin to apply.':'Network settings saved.');}catch(e){toast('Invalid relay settings: '+e.message);}};
-$('relayClear').onclick=()=>{try{sessionStorage.removeItem('frame-turn');}catch{}$('relayConfig').value='';networkText(relayLabel());toast(joined?'Default saved. Leave and rejoin to apply.':'Default network settings restored.');};
+const DEFAULT_ICE = [
+  {urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478']},
+  {urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp'}
+];
+const relayScheme = /^turns?:/i;
+const networkStorage = 'frame-turn';
+const relayTestStorage = 'frame-relay-test';
+let activeNetwork;
+
+function parseRelay(raw) {
+  if (!raw.trim()) return [];
+  let entries;
+  try { entries = JSON.parse(raw); } catch { throw Error('Paste a valid ICE server JSON array.'); }
+  if (!Array.isArray(entries) || entries.length > 8) throw Error('Expected an array of up to 8 ICE servers.');
+  return entries.map(entry => {
+    const urls = Array.isArray(entry?.urls) ? entry.urls : [entry?.urls];
+    if (!urls.length || urls.length > 8 || urls.some(url => typeof url !== 'string' ||
+      url.length > 250 || !/^(stun|stuns|turn|turns):[^\s]+$/i.test(url))) throw Error('Invalid ICE server URL.');
+    if (!urls.some(url => relayScheme.test(url))) return {urls};
+    const {username, credential} = entry;
+    if (typeof username !== 'string' || !username || typeof credential !== 'string' || !credential) {
+      throw Error('TURN requires a username and a relay credential.');
+    }
+    return {urls, username, credential};
+  });
+}
+
+function savedNetwork() {
+  let servers = [];
+  let testRequested = false;
+  try {
+    servers = parseRelay(sessionStorage.getItem(networkStorage) || '');
+    testRequested = sessionStorage.getItem(relayTestStorage) === '1';
+  } catch {}
+  const turnUrls = servers.flatMap(server => server.urls.filter(url => relayScheme.test(url)));
+  return {servers, turnUrls, relayOnly: testRequested && !!turnUrls.length};
+}
+
+function iceConfig() {
+  activeNetwork = savedNetwork();
+  const {servers, turnUrls, relayOnly} = activeNetwork;
+  const publicServers = turnUrls.length ? [] : DEFAULT_ICE;
+  return {
+    iceServers: [...servers, ...publicServers],
+    iceTransportPolicy: relayOnly ? 'relay' : 'all',
+    sdpSemantics: 'unified-plan',
+    iceCandidatePoolSize: 0
+  };
+}
+
+function networkText(text) { $('networkInfo').textContent = text; }
+
+function networkLabel(network) {
+  if (network.relayOnly) return 'Relay test mode. Only the configured TURN service can connect.';
+  if (network.turnUrls.length) return 'Private TURN configured. Direct connections are still preferred.';
+  return 'Automatic connection with public relay fallback.';
+}
+
+function updateNetworkSettings() {
+  const settings = savedNetwork();
+  $('relayConfig').value = settings.servers.length ? JSON.stringify(settings.servers, null, 2) : '';
+  $('relayOnly').checked = settings.relayOnly;
+  if (!joined) networkText(networkLabel(settings));
+}
+
+updateNetworkSettings();
+$('networkToggle').onclick = () => {
+  const panel = $('networkPanel');
+  panel.hidden = !panel.hidden;
+  $('networkToggle').setAttribute('aria-expanded', String(!panel.hidden));
+};
+$('relaySave').onclick = () => {
+  try {
+    const servers = parseRelay($('relayConfig').value);
+    const relayOnly = $('relayOnly').checked;
+    if (relayOnly && !servers.some(server => server.urls.some(url => relayScheme.test(url)))) {
+      throw Error('Add a TURN server before enabling relay test mode.');
+    }
+    if (servers.length) sessionStorage.setItem(networkStorage, JSON.stringify(servers));
+    else sessionStorage.removeItem(networkStorage);
+    if (relayOnly) sessionStorage.setItem(relayTestStorage, '1');
+    else sessionStorage.removeItem(relayTestStorage);
+    updateNetworkSettings();
+    toast(joined ? 'Saved. Leave and rejoin to apply.' : 'Network settings saved.');
+  } catch (error) {
+    toast('Could not save network settings. ' + error.message);
+  }
+};
+$('relayClear').onclick = () => {
+  try {
+    sessionStorage.removeItem(networkStorage);
+    sessionStorage.removeItem(relayTestStorage);
+    updateNetworkSettings();
+    toast(joined ? 'Default saved. Leave and rejoin to apply.' : 'Default network settings restored.');
+  } catch {
+    toast('Could not clear the saved network settings in this browser.');
+  }
+};
 const safeName=v=>String(v||'Guest').trim().slice(0,28)||'Guest';
 function status(s){ui.status.textContent=s;}function notice(s){ui.notice.textContent=s;toast(s);}function toast(s){$('toast').textContent=s;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,4500);}function id(){return Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join('');}
 const ROOM_ALPHABET='0123456789abcdefghjkmnpqrstvwxyz';
@@ -24,7 +112,7 @@ function roomTitle(){return roomSlug?roomSlug.split('-').map(x=>x.charAt(0).toUp
 function theme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem('frame-theme',t);}catch{}$('theme').setAttribute('aria-label',t==='dark'?'Switch to light mode':'Switch to night mode');document.querySelector('meta[name=theme-color]').content=t==='dark'?'#141515':'#f5f5f2';}try{theme(localStorage.getItem('frame-theme')||'dark');$('nickname').value=localStorage.getItem('frame-name')||'';}catch{}$('theme').onclick=()=>theme(document.documentElement.dataset.theme==='dark'?'light':'dark');
 const initial=parseInvite(location.hash||new URL(location.href).searchParams.get('room')||'');if(tokenRE.test(initial.key))$('roomInput').value=(initial.slug?initial.slug+'.':'')+initial.key;function startLabel(){const joining=!!$('roomInput').value.trim();$('start').firstChild.textContent=joining?'Join room ':'Create room ';$('roomNameWrap').hidden=joining;}$('roomInput').oninput=startLabel;startLabel();
 function send(c,m){if(c?.open)try{c.send(m);}catch{}}function broadcast(m){for(const c of clients.values())send(c,m);}function toHost(m){if(host)handleHost(me,m);else send(up,m);}
-function enter(){joined=true;ui.landing.hidden=true;ui.room.hidden=false;status('Connected');history.replaceState(null,'',inviteLink());$('roomTitle').textContent=roomTitle();renderPeople();$('mediaRetry').hidden=false;$('voiceCompat').hidden=!host;startNetworkWatch();updateVoiceStatus();$('mediaURL').disabled=!host;$('loadMovie').disabled=!host;$('permissionsToggle').hidden=!host;refreshAccess();if(!host)ui.notice.textContent='The host manages guest permissions. Calls and screen sharing remain available.';}
+function enter(){joined=true;ui.landing.hidden=true;ui.room.hidden=false;status('Connected');networkText(networkLabel(activeNetwork));history.replaceState(null,'',inviteLink());$('roomTitle').textContent=roomTitle();renderPeople();$('mediaRetry').hidden=false;$('voiceCompat').hidden=!host;startNetworkWatch();updateVoiceStatus();$('mediaURL').disabled=!host;$('loadMovie').disabled=!host;$('permissionsToggle').hidden=!host;refreshAccess();if(!host)ui.notice.textContent='The host manages guest permissions. Calls and screen sharing remain available.';}
 $('joinForm').onsubmit=e=>{e.preventDefault();if(peer)return;const requested=parseRoom($('roomInput').value);if($('roomInput').value.trim()&&!tokenRE.test(requested)){toast('Invalid room link or code.');return;}if(!window.Peer){toast('Signaling library unavailable. Check your internet and reload.');return;}if(!window.isSecureContext){toast('Open Frame over HTTPS or localhost.');return;}name=safeName($('nickname').value);try{localStorage.setItem('frame-name',name);}catch{}host=!requested;roomKey=requested||newRoomCode();roomSlug=host?slugify($('roomName').value):parseInvite($('roomInput').value).slug;status('Connecting…');$('start').disabled=true;peer=new Peer(host?prefix+roomKey:prefix+id(),{debug:0,config:iceConfig()});const timeout=setTimeout(()=>{if(!joined)fail('Connection timed out. Check the room link and Network settings; a TURN relay may be required.');},30000);peer.on('open',p=>{me=p;if(host){roster.set(me,{id:me,name});clearTimeout(timeout);enter();}else{up=peer.connect(prefix+roomKey,{reliable:true,serialization:'json',metadata:{room:roomKey}});up.on('open',()=>send(up,{type:'hello',name}));up.on('data',m=>{if(m?.type==='welcome'){clearTimeout(timeout);applyRoster(m.roster);enter();applyShared(m.shared,m.shareKind);applyPermissions(m.permissions);setVoiceMode(m.voiceMode===true);if(m.movie)applyMovie(m.movie);if(m.browser)applyBrowser(m.browser);}else if(m?.type==='reject'){clearTimeout(timeout);fail(String(m.reason||'Room unavailable'));}else if(joined)handleGuest(m);});up.on('close',()=>{if(!leaving){status('Host disconnected');refreshAccess();notice('The host left or the connection was lost. Rejoin using the invite link.');}});up.on('error',()=>{if(!joined)fail('Could not connect to host. Try Network settings or a dedicated TURN relay.');});}});peer.on('connection',c=>{if(!host||c.metadata?.room!==roomKey){c.close();return;}let accepted=false;const timer=setTimeout(()=>{if(!accepted)c.close();},10000);c.on('data',m=>{if(!accepted){if(m?.type!=='hello')return;if(roster.size>=MAX||clients.has(c.peer)){send(c,{type:'reject',reason:'Room is full or already connected.'});setTimeout(()=>c.close(),500);return;}accepted=true;clearTimeout(timer);clients.set(c.peer,c);roster.set(c.peer,{id:c.peer,name:safeName(m.name)});send(c,{type:'welcome',roster:[...roster.values()],shared:activeScreen,shareKind:activeShareKind,movie:currentMovie(),permissions,browser:browserState,voiceMode});publishRoster();return;}handleHost(c.peer,m);});c.on('close',()=>{clearTimeout(timer);if(accepted&&clients.get(c.peer)===c){clients.delete(c.peer);roster.delete(c.peer);if(activeScreen===c.peer)setShared('');publishRoster();}});c.on('error',()=>c.close());});peer.on('call',acceptCall);peer.on('disconnected',()=>{status('Signaling interrupted');if(!leaving&&!peer.destroyed)try{peer.reconnect();}catch{}});peer.on('error',e=>{if(!joined){clearTimeout(timeout);fail(e.type==='peer-unavailable'?'Room not found. Ask the host to keep it open.':'Connection failed: '+(e.type||'unknown'));}else notice('Connection issue: '+(e.type||'unknown')+'. Some media may not connect.');});};
 function fail(s){if(peer){leaving=true;peer.destroy();peer=null;leaving=false;}$('start').disabled=false;status('Ready');toast(s);}
 function publishRoster(){const arr=[...roster.values()];broadcast({type:'roster',roster:arr});applyRoster(arr);}
@@ -49,7 +137,67 @@ function requestScreenRetry(){if(!joined)return;if(activeScreen&&activeScreen!==
 function updateMediaOverlay(){const remote=joined&&!!activeScreen&&activeScreen!==me;const overlay=$('mediaOverlay'),action=$('mediaOverlayAction'),label=$('mediaOverlayText');if(!remote){overlay.hidden=true;return;}const stream=streams.get(key(activeScreen,'screen'));const ready=!!stream&&ui.screen.readyState>=2&&!ui.screen.paused;overlay.hidden=ready&&!autoplayBlocked;if(overlay.hidden)return;if(autoplayBlocked){label.textContent='Video ready. Tap to start playback and sound.';action.textContent='Start playback';}else if(Date.now()-screenWaitAt>18000){label.textContent='Still waiting for video. Retry or configure a TURN relay in Network.';action.textContent='Retry connection';}else{label.textContent='Connecting to shared video…';action.textContent='Retry connection';}}
 $('mediaOverlayAction').onclick=()=>{if(autoplayBlocked){play(ui.screen);return;}requestScreenRetry();};$('mediaRetry').onclick=requestScreenRetry;
 ui.screen.addEventListener('playing',()=>{autoplayBlocked=false;updateMediaOverlay();});ui.screen.addEventListener('loadeddata',updateMediaOverlay);
-function startNetworkWatch(){if(networkWatch)return;networkWatch=setInterval(async()=>{if(!joined||leaving)return;updateMediaOverlay();updateVoiceStatus();checkVoiceRetry();if(activeScreen&&activeScreen!==me&&!streams.has(key(activeScreen,'screen'))&&Date.now()-screenWaitAt>12000&&Date.now()-screenRequestAt>20000){screenRequestAt=Date.now();toHost({type:'mediaRetry'});}const list=[...out.values(),...incoming.values(),...(up?[up]:[]),...clients.values()];let direct=0,relay=0;for(const c of list){try{const pc=c.peerConnection;if(!pc||!['connected','completed'].includes(pc.iceConnectionState))continue;const stats=await pc.getStats();let selected;stats.forEach(x=>{if(x.type==='transport'&&x.selectedCandidatePairId)selected=stats.get(x.selectedCandidatePairId);});if(!selected)stats.forEach(x=>{if(x.type==='candidate-pair'&&x.state==='succeeded'&&x.nominated)selected=x;});if(selected){const l=stats.get(selected.localCandidateId),r=stats.get(selected.remoteCandidateId);if(l?.candidateType==='relay'||r?.candidateType==='relay')relay++;else direct++;}}catch{}}if(relay||direct)networkText('Active connections: '+direct+' direct, '+relay+' relayed. '+(savedRelay().length?'Custom ICE configured.':'Using default ICE services.'));},3000);}
+async function selectedRoute(connection) {
+  const pc = connection.peerConnection;
+  if (!pc || !['connected', 'completed'].includes(pc.iceConnectionState)) return null;
+  try {
+    const stats = await pc.getStats();
+    let pair;
+    stats.forEach(stat => {
+      if (stat.type === 'transport' && stat.selectedCandidatePairId) {
+        pair = stats.get(stat.selectedCandidatePairId);
+      }
+    });
+    if (!pair) stats.forEach(stat => {
+      if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.nominated) pair = stat;
+    });
+    if (!pair) return null;
+    const local = stats.get(pair.localCandidateId);
+    const remote = stats.get(pair.remoteCandidateId);
+    return {
+      relayed: local?.candidateType === 'relay' || remote?.candidateType === 'relay',
+      configured: local?.candidateType === 'relay' && (
+        activeNetwork.relayOnly || activeNetwork.turnUrls.includes(local.url)
+      )
+    };
+  } catch {
+    return null;
+  }
+}
+
+function startNetworkWatch() {
+  if (networkWatch) return;
+  networkWatch = setInterval(async () => {
+    if (!joined || leaving) return;
+    updateMediaOverlay();
+    updateVoiceStatus();
+    checkVoiceRetry();
+    if (activeScreen && activeScreen !== me && !streams.has(key(activeScreen, 'screen')) &&
+      Date.now() - screenWaitAt > 12000 && Date.now() - screenRequestAt > 20000) {
+      screenRequestAt = Date.now();
+      toHost({type: 'mediaRetry'});
+    }
+    const media = [...out.values(), ...incoming.values()];
+    const groups = [
+      ['Room connection', up ? [up] : [...clients.values()]],
+      ['Voice/camera', media.filter(connection => connection.metadata?.kind === 'av')],
+      ['Shared video', media.filter(connection => connection.metadata?.kind === 'screen')]
+    ];
+    const summary = [];
+    for (const [label, connections] of groups) {
+      const routes = (await Promise.all(connections.map(selectedRoute))).filter(Boolean);
+      if (!routes.length) continue;
+      const relayed = routes.filter(route => route.relayed).length;
+      const configured = routes.filter(route => route.configured).length;
+      const counts = [];
+      if (routes.length > relayed) counts.push((routes.length - relayed) + ' direct');
+      if (configured) counts.push(configured + ' via configured TURN');
+      if (relayed > configured) counts.push((relayed - configured) + ' relayed');
+      summary.push(label + ': ' + counts.join(', '));
+    }
+    if (!leaving) networkText(summary.length ? summary.join(' · ') : networkLabel(activeNetwork));
+  }, 3000);
+}
 function voiceElement(p){return [...$('voiceAudio').children].find(el=>el.dataset.id===p);}
 function syncVoiceElement(p,s){let a=voiceElement(p);const tracks=s?.getAudioTracks().filter(t=>t.readyState==='live')||[];if(!tracks.length){if(a){a.srcObject=null;a.remove();}return;}if(!a){a=document.createElement('audio');a.autoplay=true;a.playsInline=true;a.dataset.id=p;a.addEventListener('playing',()=>{updateVoiceStatus();});$('voiceAudio').append(a);}if(!a.srcObject||a.srcObject.getAudioTracks().map(t=>t.id).join()!==tracks.map(t=>t.id).join())a.srcObject=new MediaStream(tracks);a.muted=voiceMode;a.volume=volumes.get(p)??1;if(!voiceMode&&a.paused)playVoice(a);}
 function playVoice(a){if(voiceMode||!a?.srcObject)return;try{a.play().then(updateVoiceStatus).catch(e=>{if(e.name==='NotAllowedError'){voiceNeedsTap=true;updateVoiceStatus();}});}catch{}}
