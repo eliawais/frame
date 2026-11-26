@@ -46,6 +46,34 @@ async function waitUntil(check, ms, label) {
     let capture;
     let analyzerContext;
     let captureSource;
+    let blockStandardVoice = false;
+    const connections = new Set();
+    const NativePeerConnection = window.RTCPeerConnection;
+    const carriesAudio = connection => connection.getTransceivers().some(item =>
+      item.receiver.track.kind === 'audio');
+    window.RTCPeerConnection = class extends NativePeerConnection {
+      constructor(...options) {
+        super(...options);
+        connections.add(this);
+      }
+      createOffer(...options) {
+        if (blockStandardVoice && carriesAudio(this)) {
+          return Promise.reject(new DOMException('Test disabled the standard audio connection', 'OperationError'));
+        }
+        return super.createOffer(...options);
+      }
+    };
+    window.dropStandardVoice = () => {
+      blockStandardVoice = true;
+      let closed = 0;
+      for (const connection of connections) {
+        if (connection.connectionState !== 'closed' && carriesAudio(connection)) {
+          connection.close();
+          closed++;
+        }
+      }
+      return closed;
+    };
     const getRandomValues = crypto.getRandomValues.bind(crypto);
     let roomGenerated = false;
     if (host) {
@@ -173,6 +201,23 @@ async function waitUntil(check, ms, label) {
     console.log('Received expected ' + remoteFrequency + ' Hz backup tone: ' + played.status);
     await announce('BACKUP 1');
     await waitForMessage('BACKUP ');
+    await page.locator('#voiceRoute').click();
+    assert.equal(await page.locator('#voiceRoute').getAttribute('aria-pressed'), 'false');
+    await announce('AUTOMATIC READY');
+    await waitForMessage('AUTOMATIC READY');
+    const closedAudioConnections = await page.evaluate(() => window.dropStandardVoice());
+    assert.ok(closedAudioConnections > 0, 'The failure injection must close a real audio connection');
+    const stoppedAt = Date.now();
+    await waitUntil(async () => {
+      const result = await page.evaluate(() => window.observeVoice());
+      return result.backup >= stoppedAt + 6000 && result.status.includes('1/1 remote audio connected') &&
+        result.status.includes('1 on backup');
+    }, 26000, 'automatic backup audio after the standard path stops');
+    assert.equal(await page.locator('#voiceRoute').getAttribute('aria-pressed'), 'false');
+    assert.equal((await page.locator('#count').textContent()).trim(), '2 / 6');
+    console.log('Automatic fallback delivered the expected tone after shutting down standard audio; room stayed connected.');
+    await announce('AUTOMATIC PASSED');
+    await waitForMessage('AUTOMATIC PASSED');
     await page.locator('#mic').click();
     assert.equal((await page.locator('#mic').textContent()).trim(), 'Mic off');
     assert.deepEqual(errors, []);
