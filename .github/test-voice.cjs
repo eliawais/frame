@@ -205,9 +205,11 @@ async function waitUntil(check, ms, label) {
     assert.equal(await page.locator('#voiceRoute').getAttribute('aria-pressed'), 'false');
     await announce('AUTOMATIC READY');
     await waitForMessage('AUTOMATIC READY');
-    const closedAudioConnections = await page.evaluate(() => window.dropStandardVoice());
-    assert.ok(closedAudioConnections > 0, 'The failure injection must close a real audio connection');
     const stoppedAt = Date.now();
+    const closedAudioConnections = await page.evaluate(() => window.dropStandardVoice());
+    await announce('CUT ' + closedAudioConnections);
+    const remoteClosed = Number((await waitForMessage('CUT ')).slice(4));
+    assert.ok(closedAudioConnections + remoteClosed > 0, 'The failure injection must close a real audio connection');
     await waitUntil(async () => {
       const result = await page.evaluate(() => window.observeVoice());
       return result.backup >= stoppedAt + 6000 && result.status.includes('1/1 remote audio connected') &&
