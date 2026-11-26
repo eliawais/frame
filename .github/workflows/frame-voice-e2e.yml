@@ -1,0 +1,29 @@
+name: Frame voice connectivity check
+on:
+  push:
+    branches: [codex/frame-voice-cross-network-check]
+permissions:
+  contents: read
+jobs:
+  voice:
+    name: Voice on separate runners (${{ matrix.role }})
+    timeout-minutes: 8
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: host
+            os: ubuntu-24.04
+          - role: guest
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install browser test dependencies
+        run: |
+          npm install --no-save --package-lock=false playwright@1.55.1
+          npx playwright install --with-deps chromium
+      - name: Verify direct and backup audio
+        run: node .github/test-voice.cjs ${{ matrix.role }}
