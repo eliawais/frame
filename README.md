@@ -15,5 +15,10 @@ A lightweight static web app, using WebRTC via PeerJS Cloud for signaling. No ac
 - No DRM bypass, no cloud browser, no YouTube-specific sync, no games in this build. Mobile viewing/calling depends on browser permissions; mobile screen sharing is generally unavailable. Install the Android PWA from Chrome using Install app or Add to Home screen. No native APK is provided. Android sending of local or screen video depends on capture API availability; receiving and calling require testing.
 - Free public PeerJS signaling and STUN are best effort. There is no configured TURN relay; some networks may fail to establish connections. At six people, host upload and device resources can become bottlenecks. Rejoin after disconnects. A live cross-network test is required. Room links are bearer secrets; the public repo/site contains no room secrets.
 
+## Browser mode and guest permissions
+- Browser mode loads compatible external HTTPS pages in sandboxed iframes. The room host controls the shared address by default; the host can grant all guests browser interaction and shared URL navigation. Each participant has an independent iframe; clicks and in-page playback cannot be synchronized across third-party websites. Some sites disallow embedding or require permissions not granted by the sandbox. There is no proxy, DRM bypass, remote browser, or remote mouse control. Use regular screen sharing for a shared view of content you have permission to watch.
+- The host can enable or revoke guest play/pause for direct videos and in-room local video streams. The host validates requests; local video commands are relayed to the participant sharing the file. Screen sharing and arbitrary iframe playback cannot be remotely controlled. Guest permissions default off and reset for each new room. Refresh all devices to the same version before joining.
+- The host must stay connected, and the local video sender's browser may require an interaction to resume playback.
+
 ## Local development
 Run `python -m http.server 8000` in this folder and visit `http://localhost:8000`. Requires internet for PeerJS CDN/signaling. No npm build required.
