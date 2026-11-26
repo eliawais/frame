@@ -1,1 +1,24 @@
-{"name":"Frame - Watch together","short_name":"Frame","start_url":"./","scope":"./","display":"standalone","background_color":"#141515","theme_color":"#141515","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
+{
+  "id": "./",
+  "name": "Frame | Watch together",
+  "short_name": "Frame",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#131512",
+  "theme_color": "#131512",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-maskable.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
