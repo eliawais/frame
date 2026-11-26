@@ -25,5 +25,10 @@ A lightweight static web app, using WebRTC via PeerJS Cloud for signaling. No ac
 - For a reliable fallback, provision a TURN provider with UDP and TCP/TLS (port 443) support. Generate temporary ICE server credentials on the provider's trusted backend; paste only the returned ICE server array into Network on each device before joining. Settings are per browser tab, not shared in URLs or committed. Never enter account API keys or master secrets. Both participants may use separate valid credentials. No paid service is provisioned by this release.
 - Test on different networks (e.g. Wi-Fi and mobile data). Join, send a message, enable mic and stream a local video. Check Network; if media fails with the public relay, configure a dedicated provider. Browser embedding restrictions are separate from WebRTC connectivity.
 
+## Voice compatibility (0.6)
+- Standard voice uses independent remote audio elements rather than the camera tile; voice status reports expected remote mic streams and autoplay blocks. Click Enable sound if required. The mic is off until explicitly enabled.
+- If standard voice is silent but room chat works, the host can enable Voice compatibility. Both devices should tap Enable sound if shown and turn on their mics. This alternative sends low-rate mono 16 kHz PCM through the existing encrypted WebRTC data channels, relayed by the room host. No recording or storage is added. The host can hear/process room audio as a participant; this is not end-to-end encrypted against the host. It is intended as a best-effort fallback for small rooms, may add latency or drop audio under congestion, and does not repair failed data connections. The sender's browser must support Web Audio; ScriptProcessor is deprecated but supported by many current browsers. The mode is off by default.
+- A dedicated TURN relay remains necessary if both the data channel and media connections fail. Test between different networks before relying on either mode.
+
 ## Local development
 Run `python -m http.server 8000` in this folder and visit `http://localhost:8000`. Requires internet for PeerJS CDN/signaling. No npm build required.
