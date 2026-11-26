@@ -61,7 +61,9 @@ function page(title, body, status = 200) {
     ':root{color-scheme:dark;background:#141515;color:#f5eedc;font:16px system-ui,sans-serif}body{margin:0}main{max-width:48rem;margin:12vh auto;padding:2rem}' +
     'a{color:#c4e972}header{display:flex;align-items:center;gap:.55rem;font-size:1.5rem;font-weight:800}header img{width:2rem;height:2rem}h1{margin:1.25rem 0 .5rem;font-size:clamp(2rem,5vw,3rem)}p{color:#c8c9c0;line-height:1.55}' +
     'button,.button{display:inline-block;background:#c4e972;color:#18200d;border:0;border-radius:.55rem;font:inherit;font-weight:700;padding:.65rem .8rem;cursor:pointer;text-decoration:none}button.secondary{background:#30332d;color:#f5eedc}label[for=email-address]{display:block;margin-bottom:.4rem}input[type=email]{border:1px solid #555b4c;border-radius:.55rem;padding:.65rem .8rem;font:inherit;margin:0 .45rem .65rem 0;max-width:90%}' +
-    'table{width:100%;border-collapse:collapse;margin:1.3rem 0}th,td{padding:.6rem .35rem;text-align:left;border-bottom:1px solid #383b33;overflow-wrap:anywhere}td form{display:inline-block;margin:.18rem 0}small{color:#c8c9c0}@media(max-width:560px){main{margin-top:6vh;padding:1rem}th,td{font-size:.82rem}}</style>' +
+    'table{width:100%;border-collapse:collapse;margin:1.3rem 0}th,td{padding:.6rem .35rem;text-align:left;border-bottom:1px solid #383b33;overflow-wrap:anywhere;vertical-align:top}td form{display:inline-block;margin:.18rem 0}small{color:#c8c9c0}' +
+    '.account-details{margin:.5rem 0 0;font-size:.82em;color:#c8c9c0}.account-details div{margin:.2rem 0}.account-details dt,.account-details dd{display:inline;margin:0}.account-details dt{font-weight:650;margin-right:.35rem}' +
+    '@media(max-width:560px){main{margin-top:6vh;padding:1rem}th,td{font-size:.82rem}}</style>' +
     '<main><header><img src="/icon.svg" alt="">erev.</header><h1>' + escape(title) + "</h1>" + body + "</main></html>",
     { status, headers: out }
   );
@@ -297,9 +299,25 @@ async function verifyEmail(request, env) {
   });
 }
 
+const adminTime = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Karachi",
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+function adminDate(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(value) || !Number.isFinite(date.getTime())) return "Unavailable";
+  return '<time datetime="' + date.toISOString() + '">' + adminTime.format(date) + " PKT</time>";
+}
+
 async function adminPage(env, notice) {
   const result = await env.DB.prepare(
-    "SELECT users.id, users.email, users.name, users.status, approval_emails.sent_at " +
+    "SELECT users.id, users.email, users.name, users.status, users.created_at, approval_emails.sent_at " +
     "FROM users LEFT JOIN approval_emails ON users.approval_id = approval_emails.id " +
     "WHERE users.email <> ? ORDER BY CASE users.status WHEN 'pending' THEN 0 ELSE 1 END, users.created_at DESC LIMIT 200"
   ).bind(env.ADMIN_EMAIL.toLowerCase()).all();
@@ -316,8 +334,14 @@ async function adminPage(env, notice) {
       '"><button name="action" value="' + action + '"' + (action === "Approve" ? "" : ' class="secondary"') + ">" +
       action + "</button></form>"
     ).join(" ");
-    return "<tr><td>" + escape(user.name) + "<br><small>" + escape(user.email) + "</small></td><td>" + escape(user.status) +
-      (user.status === "approved" ? "<br><small>" + (user.sent_at ? "Email sent" : "Email pending") + "</small>" : "") +
+    const method = user.id.startsWith("email:") ? "Email link" : "Google";
+    const status = user.status.charAt(0).toUpperCase() + user.status.slice(1);
+    const details = '<dl class="account-details"><div><dt>Signed up</dt><dd>' + adminDate(user.created_at) +
+      "</dd></div><div><dt>Sign-in method</dt><dd>" + method +
+      "</dd></div><div><dt>Account ID</dt><dd>" + escape(user.id) + "</dd></div></dl>";
+    return "<tr><td>" + escape(user.name) + "<br><small>" + escape(user.email) + "</small>" + details +
+      "</td><td>" + escape(status) +
+      (user.status === "approved" ? "<br><small>" + (user.sent_at ? "Email sent " + adminDate(user.sent_at) : "Email pending") + "</small>" : "") +
       "</td><td>" + buttons + "</td></tr>";
   }).join("");
   return page("Beta access", '<p><a href="/">Open Erev</a></p>' + (message ? '<p role="status">' + message + "</p>" : "") +
