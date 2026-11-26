@@ -60,8 +60,9 @@ async function exercise(sender, viewer, label, checkAuto) {
 (async()=>{
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const url='http://127.0.0.1:'+server.address().port+'/';
+  execFileSync('ffmpeg',['-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=240x144:rate=10','-t','20','-c:v','libvpx','-b:v','160k','-threads','1',fixtureFile],{timeout:20000});
+  console.log('Generated the synthetic seek fixture.');
   const browser=await chromium.launch({args:['--autoplay-policy=no-user-gesture-required']});
-  execFileSync('ffmpeg',['-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=240x144:rate=10','-t','20','-c:v','libvpx','-b:v','160k',fixtureFile]);
   const pages=await Promise.all([browser.newPage(),browser.newPage()]);
   const [host,guest]=pages; const errors=[];
   try {
@@ -127,7 +128,9 @@ async function exercise(sender, viewer, label, checkAuto) {
       }, {frequency:index ? 640 : 480});
     }
     await openRoom(host,url,'Test Host');
+    console.log('Host room is open.');
     await openRoom(guest,host.url(),'Test Guest');
+    console.log('Guest room connection is open.');
     await checkSoon(()=>host.locator('#count').textContent(), value=>value==='2 / 6');
     for (const page of pages) {
       await page.evaluate(()=>{
