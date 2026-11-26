@@ -1,12 +1,16 @@
-# Erev (personal watch-party beta)
+# Erev
 
-A lightweight static web app, using WebRTC via PeerJS Cloud for signaling. No account or billing needed for the prototype. The host stays online and relays room state over data channels; media is peer to peer. Maximum six participants, including host. No database, storage or recording of calls/messages. Anyone who has the unguessable invitation can join. Keep it private. This is not audited or production hardened.
+An approval-only web watch party hosted at [erev.pages.dev](https://erev.pages.dev/). The signup and approval workflow uses Google OpenID Connect and Cloudflare D1. Resend delivers an email when a host operator approves a request.
 
-## Publish on GitHub Pages
-1. Create a public repository called `frame` in your GitHub account (initialize with a README if using the web UI).
-2. Upload **the files inside this folder**, not the folder itself, to the repository root, replacing the initial README if desired. Commit to `main`.
-3. Settings > Pages > Build and deployment > Deploy from a branch > main > / (root) > Save. Wait for GitHub to report successful deployment and use the published URL displayed there. HTTPS is required for media permissions.
-4. Open the site on two devices on different networks. Create a room, copy the invitation, join, allow microphone/camera, send messages, and try desktop tab sharing with audio. Test before relying on it for a movie night.
+## Cloudflare deployment
+
+1. Create the D1 database and apply `beta/schema.sql`. Bind it as `DB` in the Pages production environment.
+2. Set `PUBLIC_ORIGIN` to the canonical HTTPS origin, with no trailing slash. Set `ADMIN_EMAIL` to the owner's Gmail address.
+3. Create a Google web OAuth client and authorize `https://erev.pages.dev/auth/google/callback` as its redirect URI. Configure `GOOGLE_CLIENT_ID` and the encrypted `GOOGLE_CLIENT_SECRET` in Pages.
+4. Verify a sending domain in Resend. Set `RESEND_FROM` to an address on that domain and store a sending-only `RESEND_API_KEY` as a Pages secret.
+5. Run `node beta/build.mjs` from a checkout to produce `dist/_worker.js`. Deploy the output to the existing Pages project with its production bindings. The app retains on-screen approval status when email delivery needs a retry.
+
+GitHub Pages redirects visitors to the Cloudflare site. The app is served only to approved Erev accounts. Private room invitations issued before the beta are replaced by new beta invitations.
 
 ## Use
 - Enter a nickname and create a room, or open an invitation. New room codes are 16 random base32 characters (80 bits); optionally add a custom name, e.g. `#movie-night.4q8h2m6t9x7p3w5k`. The name is cosmetic; the random code is required to join. Copied invitations exclude tracking parameters. Legacy 32-character codes are accepted. The original host must keep the room open.
