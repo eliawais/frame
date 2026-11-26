@@ -48,20 +48,20 @@ async function waitUntil(check, ms, label) {
     let captureSource;
     let blockStandardVoice = false;
     const connections = new Set();
-    const NativePeerConnection = window.RTCPeerConnection;
+    const rtc = RTCPeerConnection.prototype;
     const carriesAudio = connection => connection.getTransceivers().some(item =>
       item.receiver.track.kind === 'audio');
-    window.RTCPeerConnection = class extends NativePeerConnection {
-      constructor(...options) {
-        super(...options);
-        connections.add(this);
+    const createOffer = rtc.createOffer;
+    rtc.createOffer = function (...options) {
+      if (blockStandardVoice && carriesAudio(this)) {
+        return Promise.reject(new DOMException('Test disabled the standard audio connection', 'OperationError'));
       }
-      createOffer(...options) {
-        if (blockStandardVoice && carriesAudio(this)) {
-          return Promise.reject(new DOMException('Test disabled the standard audio connection', 'OperationError'));
-        }
-        return super.createOffer(...options);
-      }
+      return createOffer.apply(this, options);
+    };
+    const setLocalDescription = rtc.setLocalDescription;
+    rtc.setLocalDescription = function (...options) {
+      connections.add(this);
+      return setLocalDescription.apply(this, options);
     };
     window.dropStandardVoice = () => {
       blockStandardVoice = true;
@@ -176,7 +176,7 @@ async function waitUntil(check, ms, label) {
     await waitUntil(async () => (await page.locator('#count').textContent()).trim() === '2 / 6', 150000, 'the second runner');
     await announce('NET ' + egress);
     const otherNetwork = (await waitForMessage('NET ')).slice(4);
-    console.log('Separate runners connected; distinct public egress: ' +
+    console.log('Test browsers connected; distinct public egress: ' +
       (egress === 'unknown' || otherNetwork === 'unknown' ? 'unverified' : egress !== otherNetwork));
     await page.locator('#mic').click();
     await waitUntil(async () => (await page.locator('#mic').textContent()).trim() === 'Mic on', 15000, 'local synthetic microphone');
