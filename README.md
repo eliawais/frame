@@ -26,6 +26,9 @@ A lightweight static web app, using WebRTC via PeerJS Cloud for signaling. No ac
 - For a reliable fallback, provision a TURN provider with UDP and TCP/TLS (port 443) support. Generate temporary ICE server credentials on the provider's trusted backend; paste only the returned ICE server array into Network on each device before joining. Settings are per browser tab, not shared in URLs or committed. Never enter account API keys or master secrets. Both participants may use separate valid credentials. A private configuration uses the plan and quota of the account that issued the credentials.
 - Test on different networks (e.g. Wi-Fi and mobile data). Join, send a message, enable mic and stream a local video. Check Network; if media fails with the public relay, configure a dedicated provider. Browser embedding restrictions are separate from WebRTC connectivity.
 
+## Shared-video recovery
+If the room connects but a host and guest cannot see each other’s screen share, Frame can retry the stream over their existing room connection. This uses the same peer-to-peer WebRTC transport as room chat. The feature requires Frame 0.10 on both sides. Sharing between two guests still uses its own media connection. The room connection and screen capture must both be available.
+
 ## Voice and automatic backup
 - Turn on **Mic** to speak. Camera access is independent. Frame opens its audio context when you join and shows **Enable sound** if the browser needs another interaction. Microphone access starts only when you turn on the mic.
 - Frame starts with audio over WebRTC. If a participant's mic is on and their audio track remains unavailable, Frame requests backup audio for that listener through the room's existing encrypted data channel. It returns to the standard voice connection if it recovers. Each listener can also select **Try backup voice**, or the host can select **Use backup for everyone**.
