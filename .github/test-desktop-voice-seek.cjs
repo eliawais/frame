@@ -67,9 +67,22 @@ async function exercise(sender, viewer, label, checkAuto) {
   try {
     for (const [index, page] of pages.entries()) {
       page.on('pageerror', error=>errors.push(error.message));
-      await page.route('https://media.frame.test/seek.webm', route => route.fulfill({
-        path: fixtureFile, contentType: 'video/webm', headers: {'Access-Control-Allow-Origin': '*'}
-      }));
+      await page.route('https://media.frame.test/seek.webm', async route => {
+        const data = fs.readFileSync(fixtureFile);
+        const range = route.request().headers().range?.match(/^bytes=(\d+)-(\d*)$/);
+        const headers = {'Access-Control-Allow-Origin': '*', 'Accept-Ranges': 'bytes'};
+        if (range) {
+          const start = Number(range[1]);
+          const end = range[2] ? Math.min(data.length - 1, Number(range[2])) : data.length - 1;
+          const body = data.subarray(start, end + 1);
+          return route.fulfill({status:206, body, contentType:'video/webm', headers:{
+            ...headers, 'Content-Range':'bytes '+start+'-'+end+'/'+data.length, 'Content-Length':String(body.length)
+          }});
+        }
+        return route.fulfill({status:200, body:data, contentType:'video/webm', headers:{
+          ...headers, 'Content-Length':String(data.length)
+        }});
+      });
       await page.route('https://www.youtube.com/embed/**', route => route.fulfill({body:'Test player element'}));
       await page.addInitScript(({frequency})=>{
         const sources = [];
@@ -163,6 +176,7 @@ async function exercise(sender, viewer, label, checkAuto) {
     await host.locator('#mediaURL').fill('https://media.frame.test/seek.webm');
     await host.locator('#loadMovie').click();
     await checkSoon(()=>host.locator('#roomSeek').isVisible(),Boolean,12000);
+    await checkSoon(()=>host.locator('#movie').evaluate(video=>video.currentTime), value=>value>.2,8000);
     await host.locator('#roomPause').click();
     assert.equal(await guest.locator('#roomSeek').isVisible(),false);
     await guest.evaluate(()=>toHost({type:'seekRequest',source:movieState.seekId,time:12}));
@@ -172,8 +186,13 @@ async function exercise(sender, viewer, label, checkAuto) {
     await host.locator('#allowSeek').check();
     await guest.locator('#roomSeek').waitFor({state:'visible',timeout:8000});
     await setPosition(guest,12);
-    for (const page of pages) {
-      await checkSoon(()=>page.locator('#movie').evaluate(video=>video.currentTime), value=>Math.abs(value-12)<.7,12000);
+    for (const [index, page] of pages.entries()) {
+      const result = await checkSoon(()=>page.locator('#movie').evaluate(video=>({
+        role: host ? 'host' : 'guest', time: video.currentTime, available: video.seekable.length ? video.seekable.end(0) : null,
+        permissions, sourceMatches: document.querySelector('#roomSeek').dataset.source===movieState.seekId,
+        receivedTime: movieState.time, duration:video.duration
+      })), value=>Math.abs(value.time-12)<.7,12000);
+      console.log('Direct seek state for '+(index?'guest':'host')+': '+JSON.stringify(result));
     }
     await host.locator('#allowSeek').uncheck();
     await guest.locator('#roomSeek').waitFor({state:'hidden',timeout:6000});
