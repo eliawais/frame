@@ -41,8 +41,12 @@ jobs:
           runner_sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           sudo chmod a+rw /dev/kvm
           system_image="system-images;android-35;google_apis;x86_64"
-          sdkmanager "$system_image"
-          printf 'no\n' | avdmanager create avd --force --name erev-mic --package "$system_image"
+          sdk_tools="$runner_sdk/cmdline-tools/latest/bin"
+          if [[ ! -x "$sdk_tools/sdkmanager" ]]; then
+            sdk_tools="$(dirname "$(find "$runner_sdk/cmdline-tools" -name sdkmanager | sort -V | tail -1)")"
+          fi
+          "$sdk_tools/sdkmanager" "$system_image"
+          printf 'no\n' | "$sdk_tools/avdmanager" create avd --force --name erev-mic --package "$system_image"
           "$runner_sdk/emulator/emulator" -avd erev-mic -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect > /tmp/erev-emulator.log 2>&1 &
           booted=
           for attempt in {1..90}; do
