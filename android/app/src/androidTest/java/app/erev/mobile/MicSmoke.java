@@ -71,7 +71,7 @@ public final class MicSmoke extends Instrumentation {
             if (getTargetContext().checkSelfPermission(Manifest.permission.MODIFY_AUDIO_SETTINGS) != PackageManager.PERMISSION_GRANTED) {
                 throw new AssertionError("Android audio routing permission is missing");
             }
-            Intent launch = new Intent(getTargetContext(), MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Intent launch = new Intent().setClassName("app.erev.mobile", "app.erev.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             activity = startActivitySync(launch);
             WebView web = findWebView(activity.getWindow().getDecorView());
             if (web == null) throw new AssertionError("Erev WebView not found");

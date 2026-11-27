@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   assemble:
@@ -25,15 +26,37 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
-      - run: gradle -p android assembleDebug assembleDebugAndroidTest --no-daemon
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: erev-android-beta
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          path: verify-apk
+          run-id: 46018127849
+          github-token: ${{ github.token }}
+      - name: Prepare the published APK and Android smoke test
+        run: |
+          set -euo pipefail
+          runner_sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          platform="$runner_sdk/platforms/android-35/android.jar"
+          build_tools="$(find "$runner_sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          mkdir -p verify-apk/classes verify-apk/dex
+          javac --release 17 -cp "$platform" -d verify-apk/classes android/app/src/androidTest/java/app/erev/mobile/MicSmoke.java
+          jar --create --file verify-apk/test.jar -C verify-apk/classes .
+          "$build_tools/d8" --lib "$platform" --min-api 26 --output verify-apk/dex verify-apk/test.jar
+          cat > verify-apk/AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="app.erev.mobile.test">
+            <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"/>
+            <application android:debuggable="true"/>
+            <instrumentation android:name="app.erev.mobile.MicSmoke" android:targetPackage="app.erev.mobile"/>
+          </manifest>
+          XML
+          "$build_tools/aapt" package -f -M verify-apk/AndroidManifest.xml -I "$platform" -F verify-apk/test-unsigned.apk
+          (cd verify-apk/dex && zip -q ../test-unsigned.apk classes.dex)
+          "$build_tools/zipalign" -f 4 verify-apk/test-unsigned.apk verify-apk/test-aligned.apk
+          keytool -genkeypair -keystore verify-apk/test.jks -storepass android -keypass android -alias test -keyalg RSA -keysize 2048 -dname CN=ErevSmokeTest -validity 1
+          for entry in app-debug test-aligned; do
+            "$build_tools/apksigner" sign --ks verify-apk/test.jks --ks-pass pass:android --out "verify-apk/$entry-signed.apk" "verify-apk/$entry.apk"
+            "$build_tools/apksigner" verify "verify-apk/$entry-signed.apk"
+          done
       - name: Test microphone capture and audio delivery on Android
         timeout-minutes: 12
         run: |
@@ -71,8 +94,8 @@ jobs:
           fi
           "$sdk_adb" shell input keyevent KEYCODE_WAKEUP
           "$sdk_adb" shell wm dismiss-keyguard
-          "$sdk_adb" install -g android/app/build/outputs/apk/debug/app-debug.apk
-          "$sdk_adb" install android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          "$sdk_adb" install -g verify-apk/app-debug-signed.apk
+          "$sdk_adb" install verify-apk/test-aligned-signed.apk
           result=$(timeout 80 "$sdk_adb" shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
           echo "$result"
           if ! grep -q 'result=mic-and-rtp-ok' <<< "$result"; then
