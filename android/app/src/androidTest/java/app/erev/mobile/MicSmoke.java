@@ -10,6 +10,11 @@ import android.os.SystemClock;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -20,17 +25,20 @@ public final class MicSmoke extends Instrumentation {
         <script>
         window.result = 'waiting';
         async function test() {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true}
-          });
+          window.result = 'step:getUserMedia';
+          const stream = await Promise.race([
+            navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true}}),
+            new Promise((_, reject) => setTimeout(() => reject(Error('Microphone request timed out')), 12000))
+          ]);
           const track = stream.getAudioTracks()[0];
           if (!track || !track.enabled || track.readyState !== 'live') throw Error('No live microphone');
+          window.result = 'step:microphone-live';
           const send = new RTCPeerConnection();
           const receive = new RTCPeerConnection();
           const remote = new Promise(resolve => receive.ontrack = event => resolve(event.track));
           const complete = async (pc, description) => {
             await pc.setLocalDescription(description);
-            while (pc.iceGatheringState !== 'complete') await new Promise(r => setTimeout(r, 50));
+            for (let tick = 0; pc.iceGatheringState !== 'complete' && tick < 80; tick++) await new Promise(r => setTimeout(r, 50));
             return pc.localDescription;
           };
           try {
@@ -47,15 +55,17 @@ public final class MicSmoke extends Instrumentation {
               await new Promise(r => setTimeout(r, 100));
             }
             throw Error('Peer did not receive microphone RTP packets');
+          } catch (error) {
+            window.result = 'mic-live-peer-unverified: ' + error.message;
           } finally {
             track.stop();
             send.close();
             receive.close();
           }
         }
-        window.addEventListener('load', () => test().catch(error => {
+        const runTest = () => test().catch(error => {
           window.result = error.name + ': ' + error.message;
-        }));
+        });
         </script>
         """;
 
@@ -76,14 +86,33 @@ public final class MicSmoke extends Instrumentation {
             WebView web = findWebView(activity.getWindow().getDecorView());
             if (web == null) throw new AssertionError("Erev WebView not found");
             waitForIdleSync();
-            runOnMainSync(() -> web.loadDataWithBaseURL("https://erev.pages.dev/", PAGE, "text/html", "utf-8", null));
+            runOnMainSync(() -> {
+                web.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                        if (request.isForMainFrame() && "/erev-mic-test".equals(request.getUrl().getPath())) {
+                            return new WebResourceResponse("text/html", "utf-8",
+                                new ByteArrayInputStream(PAGE.getBytes(StandardCharsets.UTF_8)));
+                        }
+                        return null;
+                    }
+
+                    @Override
+                    public void onPageFinished(WebView view, String url) {
+                        if (url.equals("https://erev.pages.dev/erev-mic-test")) {
+                            view.evaluateJavascript("if (window.result === 'waiting') runTest()", null);
+                        }
+                    }
+                });
+                web.loadUrl("https://erev.pages.dev/erev-mic-test");
+            });
             long deadline = SystemClock.elapsedRealtime() + 40_000;
             String value = "null";
             while (SystemClock.elapsedRealtime() < deadline) {
                 ArrayBlockingQueue<String> pending = new ArrayBlockingQueue<>(1);
                 runOnMainSync(() -> web.evaluateJavascript("window.result", pending::offer));
                 value = pending.poll(2, TimeUnit.SECONDS);
-                if (value != null && !value.equals("null") && !value.equals("\"waiting\"")) break;
+                if (value != null && !value.equals("null") && !value.equals("\"waiting\"") && !value.startsWith("\"step:")) break;
                 SystemClock.sleep(250);
             }
             if (!"\"mic-and-rtp-ok\"".equals(value)) throw new AssertionError("Microphone test: " + value);
