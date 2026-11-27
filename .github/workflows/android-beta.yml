@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Check live Android sign-in
+        run: |
+          origin=https://erev.pages.dev
+          proof=$(printf '%043d' 0)
+          curl --retry 2 -fsS "$origin/auth/android?challenge=$proof" | grep -q "Continue with Google"
+          curl --retry 2 -fsS "$origin/beta-invite.js" | grep -q "android-exchange"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Origin: $origin" --data "code=$proof" "$origin/auth/android/exchange")
+          test "$status" = 400
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
