@@ -1102,19 +1102,52 @@ async function toggleAV(kind){if(!joined)return;const btn=kind==='audio'?$('mic'
 function updateAV(){for(const [kind,id,label] of [['audio','mic','Mic'],['video','cam','Camera']]){const on=localAV.getTracks().some(t=>t.kind===kind&&t.readyState==='live');$(id).textContent=label+(on?' on':' off');$(id).setAttribute('aria-pressed',String(on));}}$('mic').onclick=()=>toggleAV('audio');$('cam').onclick=()=>toggleAV('video');
 let localTimeline = null, localSeekId = '';
 function setShared(who,kind='screen'){broadcast({type:'shared',id:who,kind});applyShared(who,kind);}function applyShared(who,kind='screen'){if(who!==activeScreen||kind!==activeShareKind||!screenWaitAt){localTimeline=null;screenWaitAt=Date.now();screenRequestAt=0;autoplayBlocked=false;}activeScreen=typeof who==='string'?who:'';activeShareKind=kind==='local'?'local':'screen';syncRoomScreenSenders();renderStage();refreshAccess();}
+const handheldShare = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const appleHandheld = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const displayCaptureAvailable = () => typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+const screenShareSupport = $('screenShareSupport');
+
+function screenShareHelp() {
+  if (appleHandheld) return 'Open Erev in Safari on iOS or iPadOS 27 or later to share your screen.';
+  if (handheldShare) return 'This mobile browser can watch a shared screen. To share your own screen, use a supported device.';
+  return 'This browser can watch a shared screen. To share your screen, open Erev in a supported browser.';
+}
+
+function updateScreenShareHelp() {
+  const available = displayCaptureAvailable();
+  screenShareSupport.hidden = available;
+  if (!available) screenShareSupport.textContent = screenShareHelp();
+  if (handheldShare) {
+    $('browserShareTab').textContent = 'Share screen';
+    $('youtubeShareTab').textContent = 'Share screen';
+  }
+}
+
+function setScreenShareControls(sharing) {
+  const label = sharing ? 'Stop sharing' : 'Share screen';
+  for (const button of [$('share'), $('browserShare'), $('emptyShare')]) {
+    button.textContent = label;
+    button.setAttribute('aria-pressed', String(sharing));
+  }
+}
+
+updateScreenShareHelp();
+
 let choosingShare = false;
 async function share(preferTab = false) {
   if (!joined || leaving || choosingShare) return;
   if (pendingLocal) { stopShare(false); return; }
   if (localScreen) { stopShare(); return; }
   if (activeScreen) { toast('Someone is already sharing.'); return; }
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    notice('To share a tab, open Erev on desktop Chrome or Edge.');
+  if (!displayCaptureAvailable()) {
+    notice(screenShareHelp());
     return;
   }
   choosingShare = true;
   const video = {width: {ideal: 1920}, height: {ideal: 1080}, frameRate: {ideal: 30}};
-  const options = preferTab ? {
+  const options = handheldShare ? {video:true} : preferTab ? {
     video: {...video, displaySurface: 'browser'}, audio: true,
     selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'exclude', surfaceSwitching: 'include'
   } : {video, audio: true};
@@ -1130,25 +1163,28 @@ async function share(preferTab = false) {
     track.onended = () => stopShare();
     toHost({type: 'share', on: true});
     if (!localScreen) return;
-    $('share').textContent = 'Stop sharing';
-    $('share').setAttribute('aria-pressed', 'true');
+    setScreenShareControls(true);
     publishMedia();
     renderStage();
     if (!stream.getAudioTracks().length) {
-      notice('Sharing without sound. To include sound, share a browser tab and turn on tab audio in the picker.');
+      notice(handheldShare
+        ? 'Sharing your screen. Use the room microphone if you want to talk.'
+        : 'Sharing without sound. To include sound, share a browser tab and turn on tab audio in the picker.');
     }
   } catch (error) {
-    notice(error.name === 'NotAllowedError' ? 'Sharing canceled or blocked. Select the tab and allow sharing to try again.' : 'Could not start sharing. Try desktop Chrome or Edge.');
+    if (error.name === 'NotAllowedError') notice('Screen sharing was canceled or blocked. Tap Share screen and approve the prompt to try again.');
+    else if (appleHandheld) notice('Screen sharing could not start. Open the same room in Safari on iOS or iPadOS 27 or later.');
+    else notice('Screen sharing could not start. Try sharing again in a supported browser.');
   } finally {
     choosingShare = false;
   }
 }
-function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;localSeekId='';if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');$('share').textContent='Share screen';$('share').setAttribute('aria-pressed','false');if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
+function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;localSeekId='';if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');setScreenShareControls(false);if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
 function renderStage(){const ownLocal=(localPlayback||pendingLocal)&&(!activeScreen||activeScreen===me);const s=currentScreenStream();const sharing=!!activeScreen||ownLocal;const browsing=!sharing&&!!browserState;const youtube=!sharing&&!browsing&&isYouTubeMovie();$('browserStage').hidden=!browsing;updateYouTubeStage(youtube);$('localMovie').hidden=!ownLocal;ui.screen.hidden=ownLocal||!sharing||!s;ui.movie.hidden=sharing||browsing||!movieState||youtube;$('empty').hidden=ownLocal||browsing||(sharing&&!!s)||(!sharing&&!!movieState);const displayStream=ownLocal?null:s||null;if(ui.screen.srcObject!==displayStream){autoplayBlocked=false;ui.screen.srcObject=displayStream;ui.screen.muted=activeScreen===me;if(displayStream){ui.screen.playsInline=true;ui.screen.autoplay=true;play(ui.screen);}}if(sharing&&!s&&!ownLocal){$('empty').querySelector('h2').textContent='Connecting to shared screen…';}else $('empty').querySelector('h2').textContent='Make it movie night.';if((sharing||browsing)&&!ui.movie.paused)ui.movie.pause();refreshAccess();updateMediaOverlay();}
 
 function chooseLocal(){if(!joined)return;if(localPlayback||pendingLocal){stopShare();return;}if(localScreen||activeScreen){toast('Stop the current share first.');return;}$('localFile').click();}
 $('localLabel').onclick=chooseLocal;$('emptyLocal').onclick=chooseLocal;
-$('localFile').onchange=async()=>{const file=$('localFile').files[0];$('localFile').value='';if(!file||!joined||localScreen||activeScreen||pendingLocal)return;const v=$('localMovie'),capture=v.captureStream||v.mozCaptureStream;if(!capture){notice('Local video streaming is unavailable in this browser. Use desktop Chrome or Edge.');return;}pendingLocal=true;const url=URL.createObjectURL(file);localURL=url;v.src=url;v.volume=Number($('movieVolume').value);renderStage();$('localLabel').textContent='Loading video…';try{await new Promise((resolve,reject)=>{if(v.readyState>=2){resolve();return;}const timer=setTimeout(()=>{cleanup();reject(Error('Video did not load'));},15000);function cleanup(){clearTimeout(timer);v.removeEventListener('loadeddata',ready);v.removeEventListener('error',bad);}function ready(){cleanup();resolve();}function bad(){cleanup();reject(Error('Unsupported format. Try MP4 (H.264/AAC) or WebM.'));}v.addEventListener('loadeddata',ready,{once:true});v.addEventListener('error',bad,{once:true});});if(!pendingLocal||localURL!==url)return;if(activeScreen){stopShare(false);notice('Another participant started sharing.');return;}const stream=capture.call(v);if(!stream.getVideoTracks().length){v.play().catch(()=>{});await new Promise(resolve=>{let timer;const done=()=>{clearTimeout(timer);stream.removeEventListener('addtrack',check);resolve();};const check=()=>{if(stream.getVideoTracks().length)done();};timer=setTimeout(done,2500);stream.addEventListener('addtrack',check);check();});}if(!pendingLocal||localURL!==url){stream.getTracks().forEach(t=>t.stop());return;}if(!stream.getVideoTracks().length){stream.getTracks().forEach(t=>t.stop());throw Error('Cannot capture video. Try desktop Chrome or Edge.');}if(activeScreen){stream.getTracks().forEach(t=>t.stop());stopShare(false);return;}localScreen=stream;localPlayback=true;pendingLocal=false;localSeekId=id();const changed=()=>{if(localScreen===stream)republish('screen');};stream.addEventListener('addtrack',changed);stream.addEventListener('removetrack',changed);toHost({type:'share',on:true,kind:'local'});announceLocalTimeline();if(!localScreen)return;$('share').textContent='Stop sharing';$('share').setAttribute('aria-pressed','true');$('localLabel').textContent='Stop local video';$('localLabel').setAttribute('aria-pressed','true');publishMedia();renderStage();v.play().catch(()=>toast('Press play on the movie.'));notice(stream.getAudioTracks().length?'Local video is streaming directly to the room. No upload.':'No audio track captured. Check the file or browser.');}catch(e){if(localURL===url){stopShare(false);notice(e.message||'Could not play video.');}}};
+$('localFile').onchange=async()=>{const file=$('localFile').files[0];$('localFile').value='';if(!file||!joined||localScreen||activeScreen||pendingLocal)return;const v=$('localMovie'),capture=v.captureStream||v.mozCaptureStream;if(!capture){notice('Local video streaming is unavailable in this browser. Use desktop Chrome or Edge.');return;}pendingLocal=true;const url=URL.createObjectURL(file);localURL=url;v.src=url;v.volume=Number($('movieVolume').value);renderStage();$('localLabel').textContent='Loading video…';try{await new Promise((resolve,reject)=>{if(v.readyState>=2){resolve();return;}const timer=setTimeout(()=>{cleanup();reject(Error('Video did not load'));},15000);function cleanup(){clearTimeout(timer);v.removeEventListener('loadeddata',ready);v.removeEventListener('error',bad);}function ready(){cleanup();resolve();}function bad(){cleanup();reject(Error('Unsupported format. Try MP4 (H.264/AAC) or WebM.'));}v.addEventListener('loadeddata',ready,{once:true});v.addEventListener('error',bad,{once:true});});if(!pendingLocal||localURL!==url)return;if(activeScreen){stopShare(false);notice('Another participant started sharing.');return;}const stream=capture.call(v);if(!stream.getVideoTracks().length){v.play().catch(()=>{});await new Promise(resolve=>{let timer;const done=()=>{clearTimeout(timer);stream.removeEventListener('addtrack',check);resolve();};const check=()=>{if(stream.getVideoTracks().length)done();};timer=setTimeout(done,2500);stream.addEventListener('addtrack',check);check();});}if(!pendingLocal||localURL!==url){stream.getTracks().forEach(t=>t.stop());return;}if(!stream.getVideoTracks().length){stream.getTracks().forEach(t=>t.stop());throw Error('Cannot capture video. Try desktop Chrome or Edge.');}if(activeScreen){stream.getTracks().forEach(t=>t.stop());stopShare(false);return;}localScreen=stream;localPlayback=true;pendingLocal=false;localSeekId=id();const changed=()=>{if(localScreen===stream)republish('screen');};stream.addEventListener('addtrack',changed);stream.addEventListener('removetrack',changed);toHost({type:'share',on:true,kind:'local'});announceLocalTimeline();if(!localScreen)return;setScreenShareControls(true);$('localLabel').textContent='Stop local video';$('localLabel').setAttribute('aria-pressed','true');publishMedia();renderStage();v.play().catch(()=>toast('Press play on the movie.'));notice(stream.getAudioTracks().length?'Local video is streaming directly to the room. No upload.':'No audio track captured. Check the file or browser.');}catch(e){if(localURL===url){stopShare(false);notice(e.message||'Could not play video.');}}};
 
 function canPlayback(){return host||permissions.playback===true;}
 function canBrowse(){return host||permissions.browse===true;}
