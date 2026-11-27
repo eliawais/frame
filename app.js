@@ -1,6 +1,6 @@
 'use strict';
 const $=id=>document.getElementById(id), ui={landing:$('landing'),room:$('room'),status:$('status'),notice:$('notice'),movie:$('movie'),screen:$('screenVideo')};
-const MAX=6, prefix='erev-beta-v1-', tokenRE=/^(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;let permissions={playback:false,browse:false,seek:false},browserState='',browserSelected=false,activeShareKind='screen';let peer,roomKey='',roomSlug='',signalingCode='',joining=false,me='',name='',host=false,up=null,roster=new Map(),clients=new Map(),out=new Map(),incoming=new Map(),streams=new Map(),volumes=new Map(),localAV=new MediaStream(),localScreen=null,activeScreen='',movieState=null,applying=false,applyTimer,toastTimer,localURL='',localPlayback=false,pendingLocal=false,joined=false,leaving=false;
+const MAX=6, prefix='erev-beta-v2-', tokenRE=/^(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;let permissions={playback:false,browse:false,seek:false},browserState='',browserSelected=false,activeShareKind='screen';let peer,roomKey='',roomSlug='',signalingCode='',joining=false,me='',name='',host=false,up=null,roster=new Map(),clients=new Map(),out=new Map(),incoming=new Map(),streams=new Map(),volumes=new Map(),localAV=new MediaStream(),localScreen=null,activeScreen='',movieState=null,applying=false,applyTimer,toastTimer,localURL='',localPlayback=false,pendingLocal=false,joined=false,leaving=false;
 let voiceMode=false,voiceContext=null,voiceInput=null,voiceProcessor=null,voiceSilent=null,voiceTrack=null,voiceNeedsTap=false;const voiceQueue = new Map(), voiceGains = new Map(), voiceSources = new Map();
 const voiceRate = new Map(), voiceLast = new Map(), voiceRequestAt = new Map();
 const voiceMissingSince = new Map(), voiceBackup = new Set(), voiceWarmUntil = new Map();
@@ -117,17 +117,283 @@ function theme(t){document.documentElement.dataset.theme=t;try{localStorage.setI
 const initial=parseInvite(location.hash||new URL(location.href).searchParams.get('room')||'');if(tokenRE.test(initial.key))$('roomInput').value=(initial.slug?initial.slug+'.':'')+initial.key;function startLabel(){const joining=!!$('roomInput').value.trim();$('start').firstChild.textContent=joining?'Join room ':'Create room ';$('roomNameWrap').hidden=joining;}$('roomInput').oninput=startLabel;startLabel();
 function send(c,m){if(c?.open)try{c.send(m);}catch{}}function broadcast(m){for(const c of clients.values())send(c,m);}function toHost(m){if(host)handleHost(me,m);else send(up,m);}
 function enter(){joined=true;ui.landing.hidden=true;ui.room.hidden=false;status('Connected');networkText(networkLabel(activeNetwork));history.replaceState(null,'',inviteLink());$('roomTitle').textContent=roomTitle();renderPeople();$('mediaRetry').hidden=false;$('voiceCompat').hidden=!host;startNetworkWatch();updateVoiceStatus();$('mediaURL').disabled=!host;$('loadMovie').disabled=!host;$('permissionsToggle').hidden=!host;refreshAccess();if(!host)ui.notice.textContent='The host manages guest permissions. Calls and screen sharing remain available.';}
-$('joinForm').onsubmit=async e=>{e.preventDefault();if(peer||joining)return;const requested=parseRoom($('roomInput').value);if($('roomInput').value.trim()&&!tokenRE.test(requested)){toast('Invalid room link or code.');return;}if(!window.Peer){toast('Signaling library unavailable. Check your internet and reload.');return;}if(!window.isSecureContext){toast('Open Erev over HTTPS or localhost.');return;}enableSound();name=safeName($('nickname').value);try{localStorage.setItem('frame-name',name);}catch{}host=!requested;roomKey=requested||newRoomCode();roomSlug=host?slugify($('roomName').value):parseInvite($('roomInput').value).slug;status('Connecting…');$('start').disabled=true;joining=true;
-try {
-  const response=await fetch('./api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:host?'create':'join',code:roomKey})});
-  if(response.status===401||response.status===403){location.reload();return;}
-  const result=await response.json();
-  if(!response.ok||!/^[a-f0-9]{32}$/.test(result.signalingCode||''))throw Error(result.error||'Could not start the room.');
-  signalingCode=result.signalingCode;
-}catch(error){fail(error.message||'Could not connect to Erev.');return;}
-finally{joining=false;}
-peer=new Peer(host?prefix+signalingCode:prefix+id(),{debug:0,config:iceConfig()});const timeout=setTimeout(()=>{if(!joined)fail('Connection timed out. Check the room link and Network settings; a TURN relay may be required.');},30000);peer.on('open',p=>{me=p;if(host){roster.set(me,{id:me,name});clearTimeout(timeout);enter();}else{up=peer.connect(prefix+signalingCode,{reliable:true,serialization:'json',metadata:{room:signalingCode}});up.on('open',()=>send(up,{type:'hello',name,roomScreen:true,roomVoice:true}));up.on('data',m=>{if(m?.type==='welcome'){if(m.roomScreen===true)roomScreenSupport.add(up);if(m.roomVoice===true)roomVoiceSupport.add(up);clearTimeout(timeout);applyRoster(m.roster);enter();applyShared(m.shared,m.shareKind);applyLocalTimeline(m.timeline);applyPermissions(m.permissions);setVoiceMode(m.voiceMode===true);if(m.movie)applyMovie(m.movie);if(m.browser)applyBrowser(m.browser);}else if(m?.type==='reject'){clearTimeout(timeout);fail(String(m.reason||'Room unavailable'));}else if(joined)handleGuest(m);});up.on('close',()=>{if(!leaving){status('Host disconnected');stopVoiceCapture();clearVoicePlayback();if(activeScreen===up.peer)applyShared('');refreshAccess();notice('The host left or the connection was lost. Rejoin using the invite link.');updateVoiceStatus();}});up.on('error',()=>{if(!joined)fail('Could not connect to host. Try Network settings or a dedicated TURN relay.');});}});peer.on('connection',c=>{if(!host||c.metadata?.room!==signalingCode){c.close();return;}let accepted=false;const timer=setTimeout(()=>{if(!accepted)c.close();},10000);c.on('data',m=>{if(!accepted){if(m?.type!=='hello')return;if(roster.size>=MAX||clients.has(c.peer)){send(c,{type:'reject',reason:'Room is full or already connected.'});setTimeout(()=>c.close(),500);return;}accepted=true;clearTimeout(timer);if(m.roomScreen===true)roomScreenSupport.add(c);if(m.roomVoice===true)roomVoiceSupport.add(c);clients.set(c.peer,c);roster.set(c.peer,{id:c.peer,name:safeName(m.name)});send(c,{type:'welcome',roster:[...roster.values()],shared:activeScreen,shareKind:activeShareKind,movie:currentMovie(),permissions,browser:browserState,voiceMode,roomScreen:true,roomVoice:true,timeline:localTimeline});publishRoster();connectRoomVoice(c.peer);return;}handleHost(c.peer,m);});c.on('close',()=>{clearTimeout(timer);if(accepted&&clients.get(c.peer)===c){clients.delete(c.peer);roster.delete(c.peer);removeVoiceParticipant(c.peer);if(activeScreen===c.peer)setShared('');publishRoster();}});c.on('error',()=>c.close());});peer.on('call',acceptCall);peer.on('disconnected',()=>{status('Signaling interrupted');if(!leaving&&!peer.destroyed)try{peer.reconnect();}catch{}});peer.on('error',e=>{if(!joined){clearTimeout(timeout);fail(e.type==='peer-unavailable'?'Room not found. Ask the host to keep it open.':'Connection failed: '+(e.type||'unknown'));}else notice('Connection issue: '+(e.type||'unknown')+'. Some media may not connect.');});};
-function fail(s){if(peer){leaving=true;peer.destroy();peer=null;leaving=false;}$('start').disabled=false;status('Ready');toast(s);}
+const webPeerPattern = /^erev-beta-v2-[a-f0-9]{32}$/;
+const proofNoncePattern = /^[a-f0-9]{32}$/;
+const publicKeyPattern = /^B[A-Za-z0-9_-]{86}$/;
+const proofPattern = /^[A-Za-z0-9_-]{86}$/;
+const ecKey = {name:'ECDSA',namedCurve:'P-256'};
+const ecSignature = {name:'ECDSA',hash:'SHA-256'};
+let roomAccessState = null;
+
+function roomProofBytes(purpose, from, to, nonce, time = 0) {
+  return new TextEncoder().encode(JSON.stringify([purpose, signalingCode, from, to, nonce, time]));
+}
+
+function encodeRoomProof(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');
+}
+
+function decodeRoomProof(value, padding) {
+  return Uint8Array.from(atob(value.replaceAll('-','+').replaceAll('_','/') + padding), ch=>ch.charCodeAt(0));
+}
+
+async function signRoomProof(access, purpose, from, to, nonce, time) {
+  return encodeRoomProof(await crypto.subtle.sign(ecSignature, access.privateKey, roomProofBytes(purpose, from, to, nonce, time)));
+}
+
+async function verifyRoomProof(access, purpose, from, to, nonce, proof, time) {
+  if (access !== roomAccessState || Date.now() >= access.deadline || !webPeerPattern.test(from) ||
+      !proofNoncePattern.test(nonce || '') || !proofPattern.test(proof || '')) return false;
+  const member = access.members.get(from);
+  if (!member) return false;
+  try {
+    member.verifier ??= crypto.subtle.importKey('raw', decodeRoomProof(member.publicKey, '='), ecKey, false, ['verify']);
+    const valid = await crypto.subtle.verify(ecSignature, await member.verifier, decodeRoomProof(proof, '=='),
+      roomProofBytes(purpose, from, to, nonce, time));
+    return valid && access === roomAccessState && Date.now() < access.deadline && access.members.get(from)?.publicKey === member.publicKey;
+  } catch {
+    return false;
+  }
+}
+
+function roomRequest(body, options = {}) {
+  return fetch('./api/rooms', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),...options});
+}
+
+function releaseRoomAccess() {
+  const access = roomAccessState;
+  if (!access) return;
+  roomAccessState = null;
+  clearInterval(access.timer);
+  roomRequest({action:'leave',code:access.code,peerId:access.peerId},{keepalive:true}).catch(()=>{});
+}
+
+function endRoomAccess(message) {
+  if (!joined) { fail(message); return; }
+  leaving = true;
+  releaseRoomAccess();
+  stopShare(false);
+  localAV.getTracks().forEach(track=>track.stop());
+  stopVoiceCapture();
+  clearVoicePlayback();
+  peer?.destroy();
+  ui.room.hidden = true;
+  status('Room ended');
+  notice(message);
+  toast(message);
+  location.replace('/');
+}
+
+function syncRoomAccess(access) {
+  if (!access || access !== roomAccessState) return Promise.resolve(false);
+  if (access.pending) return access.pending;
+  access.pending = (async()=>{
+    const requestAt = Date.now();
+    try {
+      const response = await roomRequest({action:'sync',code:access.code,peerId:access.peerId},{signal:AbortSignal.timeout(8000)});
+      if (access !== roomAccessState) return false;
+      if (response.status === 401 || response.status === 403) {
+        endRoomAccess('Your room access ended. Sign in or ask the host for a fresh invite.');
+        return false;
+      }
+      if (!response.ok) return false;
+      const result = await response.json();
+      if (access !== roomAccessState || !Number.isFinite(result.leaseMs) || !Number.isFinite(result.serverTime) ||
+          !Array.isArray(result.members)) return false;
+      const members = new Map();
+      for (const member of result.members) {
+        if (!webPeerPattern.test(member?.peerId || '') || !publicKeyPattern.test(member?.publicKey || '')) return false;
+        const cached = access.members.get(member.peerId);
+        members.set(member.peerId, cached?.publicKey === member.publicKey ? cached : {publicKey:member.publicKey});
+      }
+      if (!members.has(access.peerId) || members.get(access.hostPeerId)?.publicKey !== access.hostKey) return false;
+      access.members = members;
+      access.deadline = requestAt + Math.min(60_000,result.leaseMs);
+      access.clockOffset = result.serverTime - Date.now();
+      for (const connection of [...clients.values(), ...out.values(), ...incoming.values()]) {
+        if (!members.has(connection.peer)) connection.close();
+      }
+      if (joined) publishMedia();
+      return true;
+    } catch {
+      return false;
+    }
+  })().finally(()=>{access.pending=null;});
+  return access.pending;
+}
+
+function watchRoomAccess(access) {
+  access.timer = setInterval(()=>{
+    if (access !== roomAccessState) { clearInterval(access.timer); return; }
+    if (Date.now() >= access.deadline) {
+      endRoomAccess('Room access expired. Rejoin to continue.');
+      return;
+    }
+    if (joined) syncRoomAccess(access);
+  },15_000);
+}
+
+document.addEventListener('visibilitychange',()=>{
+  if (!document.hidden && joined && roomAccessState) syncRoomAccess(roomAccessState);
+});
+
+function connectToHost(access, timeout) {
+  const connection = peer.connect(access.hostPeerId, {reliable:true,serialization:'json',metadata:{room:signalingCode}});
+  up = connection;
+  const guestNonce = id();
+  let challenged = false;
+  let queue = Promise.resolve();
+  connection.on('data', message=>{
+    queue = queue.then(async()=>{
+      if (access !== roomAccessState || !message || Date.now() >= access.deadline) return;
+      if (joined) { handleGuest(message); return; }
+      if (message.type === 'reject') { clearTimeout(timeout); fail('The host could not admit you to the room.'); return; }
+      if (message.type === 'challenge' && !challenged && proofNoncePattern.test(message.nonce || '')) {
+        challenged = true;
+        const proof = await signRoomProof(access,'guest',me,connection.peer,message.nonce);
+        if (access === roomAccessState) send(connection,{type:'hello',nonce:guestNonce,proof,name,roomScreen:true,roomVoice:true});
+        return;
+      }
+      if (message.type !== 'welcome' || !challenged) return;
+      if (!await verifyRoomProof(access,'host',connection.peer,me,guestNonce,message.proof) || !await syncRoomAccess(access)) {
+        if (access === roomAccessState) fail('Could not verify the host. Rejoin with a new invite.');
+        return;
+      }
+      if (message.roomScreen === true) roomScreenSupport.add(connection);
+      if (message.roomVoice === true) roomVoiceSupport.add(connection);
+      clearTimeout(timeout);
+      applyRoster(message.roster);
+      enter();
+      applyShared(message.shared,message.shareKind);
+      applyLocalTimeline(message.timeline);
+      applyPermissions(message.permissions);
+      setVoiceMode(message.voiceMode === true);
+      if (message.movie) applyMovie(message.movie);
+      if (message.browser) applyBrowser(message.browser);
+    }).catch(()=>{if (access === roomAccessState && !joined) fail('Could not verify the host.');});
+  });
+  connection.on('close',()=>{
+    if (leaving || access !== roomAccessState) return;
+    if (!joined) { clearTimeout(timeout); fail('The host connection closed. Try joining again.'); return; }
+    endRoomAccess('The host left or the connection was lost. Rejoin using a current invite.');
+  });
+  connection.on('error',()=>{if (!joined && access === roomAccessState) fail('Could not connect to host. Try Network settings or a dedicated TURN relay.');});
+}
+
+function admitGuest(connection, access) {
+  if (!host || !joined || access !== roomAccessState || connection.metadata?.room !== signalingCode ||
+      !webPeerPattern.test(connection.peer) || connection.peer === me) { connection.close(); return; }
+  let accepted = false;
+  let checking = false;
+  const nonce = id();
+  const timer = setTimeout(()=>{if(!accepted)connection.close();},10_000);
+  connection.on('open',()=>send(connection,{type:'challenge',nonce}));
+  connection.on('data',async message=>{
+    if (access !== roomAccessState || Date.now() >= access.deadline) { connection.close(); return; }
+    if (accepted) { if (access.members.has(connection.peer)) handleHost(connection.peer,message); return; }
+    if (checking || message?.type !== 'hello' || !proofNoncePattern.test(message.nonce || '')) return;
+    checking = true;
+    try {
+      const current = await syncRoomAccess(access);
+      const valid = current && await verifyRoomProof(access,'guest',connection.peer,me,nonce,message.proof);
+      if (!valid || !connection.open || roster.size >= MAX || clients.has(connection.peer)) {
+        send(connection,{type:'reject'});
+        setTimeout(()=>connection.close(),300);
+        return;
+      }
+      const proof = await signRoomProof(access,'host',me,connection.peer,message.nonce);
+      if (!connection.open || access !== roomAccessState || !access.members.has(connection.peer) ||
+          roster.size >= MAX || clients.has(connection.peer)) { connection.close(); return; }
+      accepted = true;
+      clearTimeout(timer);
+      if (message.roomScreen === true) roomScreenSupport.add(connection);
+      if (message.roomVoice === true) roomVoiceSupport.add(connection);
+      clients.set(connection.peer,connection);
+      roster.set(connection.peer,{id:connection.peer,name:safeName(message.name)});
+      send(connection,{type:'welcome',proof,roster:[...roster.values()],shared:activeScreen,shareKind:activeShareKind,movie:currentMovie(),
+        permissions,browser:browserState,voiceMode,roomScreen:true,roomVoice:true,timeline:localTimeline});
+      publishRoster();
+      connectRoomVoice(connection.peer);
+    }catch{connection.close();}
+  });
+  connection.on('close',()=>{
+    clearTimeout(timer);
+    if (!accepted || clients.get(connection.peer) !== connection) return;
+    clients.delete(connection.peer);
+    roster.delete(connection.peer);
+    removeVoiceParticipant(connection.peer);
+    if (activeScreen === connection.peer) setShared('');
+    publishRoster();
+  });
+  connection.on('error',()=>connection.close());
+}
+
+$('joinForm').onsubmit=async event=>{
+  event.preventDefault();
+  if (peer || joining) return;
+  const requested = parseRoom($('roomInput').value);
+  if ($('roomInput').value.trim() && !tokenRE.test(requested)) { toast('Invalid room link or code.'); return; }
+  if (!window.Peer) { toast('Signaling library unavailable. Check your internet and reload.'); return; }
+  if (!window.isSecureContext || !crypto.subtle) { toast('Open Erev over HTTPS in a current browser.'); return; }
+  enableSound();
+  name=safeName($('nickname').value);
+  try{localStorage.setItem('frame-name',name);}catch{}
+  host=!requested;
+  roomKey=requested||newRoomCode();
+  roomSlug=host?slugify($('roomName').value):parseInvite($('roomInput').value).slug;
+  status('Connecting…');
+  $('start').disabled=true;
+  joining=true;
+  let access;
+  try {
+    const keys=await crypto.subtle.generateKey(ecKey,false,['sign','verify']);
+    const publicKey=encodeRoomProof(await crypto.subtle.exportKey('raw',keys.publicKey));
+    const requestAt=Date.now();
+    const response=await roomRequest({action:host?'create':'join',code:roomKey,publicKey},{signal:AbortSignal.timeout(8000)});
+    if(response.status===401||response.status===403){location.reload();return;}
+    const result=await response.json();
+    if(!response.ok||!/^[a-f0-9]{32}$/.test(result.signalingCode||'')||!webPeerPattern.test(result.peerId||'')||
+       !webPeerPattern.test(result.hostPeerId||'')||!publicKeyPattern.test(result.hostKey||'')||
+       !Number.isFinite(result.leaseMs)||!Number.isFinite(result.serverTime)){
+      throw Error(result.error||'Could not start the room.');
+    }
+    signalingCode=result.signalingCode;
+    access={code:roomKey,peerId:result.peerId,hostPeerId:result.hostPeerId,hostKey:result.hostKey,privateKey:keys.privateKey,
+      deadline:requestAt+Math.min(60_000,result.leaseMs),clockOffset:result.serverTime-Date.now(),
+      members:new Map([[result.hostPeerId,{publicKey:result.hostKey}],[result.peerId,{publicKey}]]),seenMedia:new Map()};
+    roomAccessState=access;
+    peer=new Peer(result.peerId,{debug:0,config:iceConfig()});
+  }catch(error){fail(error.message||'Could not connect to Erev.');return;}
+  finally{joining=false;}
+  const timeout=setTimeout(()=>{if(!joined&&access===roomAccessState)fail('Connection timed out. Check the room link and Network settings.');},30_000);
+  watchRoomAccess(access);
+  peer.on('open',id=>{
+    if (access !== roomAccessState) return;
+    if (id !== access.peerId) { fail('The signaling service returned an invalid identity.'); return; }
+    me=id;
+    if(host){roster.set(me,{id:me,name});clearTimeout(timeout);enter();}
+    else connectToHost(access,timeout);
+  });
+  peer.on('connection',connection=>admitGuest(connection,access));
+  peer.on('call',acceptCall);
+  peer.on('disconnected',()=>{if(access===roomAccessState&&!leaving&&!peer.destroyed){status('Signaling interrupted');try{peer.reconnect();}catch{}}});
+  peer.on('error',error=>{
+    if (access !== roomAccessState) return;
+    if(!joined){clearTimeout(timeout);fail(error.type==='peer-unavailable'?'Room not found. Ask the host to keep it open.':'Connection failed: '+(error.type||'unknown'));}
+    else notice('Connection issue: '+(error.type||'unknown')+'. Some media may not connect.');
+  });
+};
+
+function fail(message) {
+  leaving = true;
+  releaseRoomAccess();
+  peer?.destroy();
+  peer = null;
+  leaving = false;
+  $('start').disabled = false;
+  status('Ready');
+  toast(message);
+}
 function publishRoster(){const arr=[...roster.values()];broadcast({type:'roster',roster:arr});applyRoster(arr);}
 function applyRoster(arr){if(!Array.isArray(arr)||arr.length>MAX)return;roster=new Map(arr.filter(x=>typeof x?.id==='string').map(x=>[x.id,{id:x.id,name:safeName(x.name),mic:x.mic===true}]));for(const [k,c] of out)if(!roster.has(c.peer)){c.close();out.delete(k);}for(const [k,c] of incoming)if(!roster.has(c.peer)){c.close();incoming.delete(k);streams.delete(k);}if(activeScreen&&!roster.has(activeScreen))applyShared('');renderPeople();publishMedia();}
 function handleHost(who,m){if(!m||!roster.has(who))return;if(handleVoiceHost(who,m))return;if(handleRoomRequest(who,m))return;if(m.type==='chat'&&typeof m.text==='string'&&m.text.trim()){const msg={type:'chat',from:who,name:roster.get(who).name,text:m.text.trim().slice(0,1000)};displayChat(msg);broadcast(msg);}else if(m.type==='share'){if(m.on===true){if(activeScreen&&activeScreen!==who){if(who===me){stopShare(false);notice('Someone is already sharing.');}else send(clients.get(who),{type:'shareDenied'});return;}setShared(who,m.kind==='local'?'local':'screen');}else if(activeScreen===who)setShared('');}}
@@ -207,10 +473,71 @@ function hasSource(kind){return !!sourceFor(kind)?.getTracks().some(t=>t.readySt
 function clearRetry(k){const timer=retryTimers.get(k);if(timer)clearTimeout(timer);retryTimers.delete(k);}
 function scheduleRetry(p,kind){const k=key(p,kind);if(leaving||!roster.has(p)||!hasSource(kind)||retryTimers.has(k))return;const attempts=retryAttempts.get(k)||0;if(attempts>=3){networkText('A media connection failed after retries. A dedicated TURN relay may be required.');return;}retryAttempts.set(k,attempts+1);retryTimers.set(k,setTimeout(()=>{retryTimers.delete(k);if(!out.has(k)&&roster.has(p)&&hasSource(kind))publishMedia();},1000*Math.pow(2,attempts)));}
 function watchConnection(c,onFailure,onConnected){const pc=c.peerConnection;if(!pc)return;let failed=false,disconnectTimer,deadline;const good=()=>['connected','completed'].includes(pc.iceConnectionState)||pc.connectionState==='connected';const stop=()=>{clearTimeout(disconnectTimer);clearTimeout(deadline);pc.removeEventListener('iceconnectionstatechange',check);pc.removeEventListener('connectionstatechange',check);};function fail(){if(failed)return;failed=true;stop();onFailure();}function check(){if(good()){clearTimeout(disconnectTimer);clearTimeout(deadline);onConnected?.();return;}if(pc.iceConnectionState==='failed'||pc.connectionState==='failed'){fail();return;}if(pc.iceConnectionState==='disconnected'||pc.connectionState==='disconnected'){if(!disconnectTimer)disconnectTimer=setTimeout(()=>{if(!good())fail();},7000);}else{clearTimeout(disconnectTimer);disconnectTimer=null;}}deadline=setTimeout(()=>{if(!good())fail();},22000);pc.addEventListener('iceconnectionstatechange',check);pc.addEventListener('connectionstatechange',check);c.on('close',stop);c.on('error',stop);check();}
-function publishMedia(){if(!peer?.open)return;for(const p of roster.keys()){if(p===me)continue;for(const kind of ['av','screen']){const k=key(p,kind),s=sourceFor(kind);if(!hasSource(kind)||out.has(k)||retryTimers.has(k))continue;const roomConnection=kind==='screen'&&roomScreenConnection(p);if(roomConnection&&roomScreenLinks.get(roomConnection)?.sending)continue;try{const c=peer.call(p,s,{metadata:{room:signalingCode,kind}});if(!c){scheduleRetry(p,kind);continue;}out.set(k,c);const failed=()=>{if(out.get(k)!==c)return;out.delete(k);try{c.close();}catch{}scheduleRetry(p,kind);};c.on('close',failed);c.on('error',failed);watchConnection(c,failed,()=>{retryAttempts.delete(k);clearRetry(k);});}catch{scheduleRetry(p,kind);}}}}
+const pendingMedia = new Set();
+
+async function sendRoomMedia(access, target, kind, stream) {
+  const key = target + '|' + kind;
+  if (pendingMedia.has(key)) return;
+  pendingMedia.add(key);
+  try {
+    const nonce = id();
+    const time = Math.round(Date.now() + access.clockOffset);
+    const proof = await signRoomProof(access,'media:'+kind,me,target,nonce,time);
+    if (access !== roomAccessState || !peer?.open || !roster.has(target) || !access.members.has(target) ||
+        sourceFor(kind) !== stream || !hasSource(kind) || out.has(key) || Date.now() >= access.deadline) return;
+    const connection = peer.call(target,stream,{metadata:{room:signalingCode,kind,nonce,time,proof}});
+    if (!connection) { scheduleRetry(target,kind); return; }
+    out.set(key,connection);
+    const failed=()=>{
+      if(out.get(key)!==connection)return;
+      out.delete(key);
+      try{connection.close();}catch{}
+      scheduleRetry(target,kind);
+    };
+    connection.on('close',failed);
+    connection.on('error',failed);
+    watchConnection(connection,failed,()=>{retryAttempts.delete(key);clearRetry(key);});
+  }catch{
+    if (access === roomAccessState) scheduleRetry(target,kind);
+  }finally{
+    pendingMedia.delete(key);
+  }
+}
+
+function publishMedia() {
+  const access = roomAccessState;
+  if (!joined || !peer?.open || !access || Date.now() >= access.deadline) return;
+  for (const target of roster.keys()) {
+    if (target === me || !access.members.has(target)) continue;
+    for (const kind of ['av','screen']) {
+      const k=key(target,kind);
+      if (!hasSource(kind) || out.has(k) || retryTimers.has(k)) continue;
+      const link = kind === 'screen' && roomScreenConnection(target);
+      if (link && roomScreenLinks.get(link)?.sending) continue;
+      sendRoomMedia(access,target,kind,sourceFor(kind));
+    }
+  }
+}
 function retryPeerMedia(p,kind){if(!roster.has(p)||p===me||!hasSource(kind))return;const k=key(p,kind),c=out.get(k);clearRetry(k);retryAttempts.delete(k);if(c){out.delete(k);c.close();}publishMedia();}
 function republish(kind){if(kind==='screen')syncRoomScreenSenders();for(const k of [...retryTimers.keys()])if(k.endsWith('|'+kind))clearRetry(k);for(const k of [...retryAttempts.keys()])if(k.endsWith('|'+kind))retryAttempts.delete(k);for(const [k,c] of [...out])if(k.endsWith('|'+kind)){out.delete(k);c.close();}publishMedia();}
-function acceptCall(c){const kind=c.metadata?.kind;if(c.metadata?.room!==signalingCode||!['av','screen'].includes(kind)||!c.peer.startsWith(prefix)||!me){c.close();return;}const k=key(c.peer,kind),old=incoming.get(k);incoming.set(k,c);streams.delete(k);old?.close();c.on('stream',s=>{if(incoming.get(k)!==c)return;streams.set(k,s);if(kind==='screen'&&ui.screen.srcObject!==s)autoplayBlocked=false;renderPeople();renderStage();});const clean=()=>{if(incoming.get(k)===c){incoming.delete(k);streams.delete(k);if(kind==='screen'&&activeScreen===c.peer){screenWaitAt=Date.now();autoplayBlocked=false;}renderPeople();renderStage();}};c.on('close',clean);c.on('error',clean);try{c.answer();watchConnection(c,()=>{clean();c.close();},()=>{});}catch{clean();c.close();}}
+async function acceptCall(c) {
+  const access = roomAccessState;
+  const {room,kind,nonce,time,proof}=c.metadata ?? {};
+  const seenKey=c.peer+'|'+nonce;
+  if (!access || !joined || room !== signalingCode || !['av','screen'].includes(kind) ||
+      !roster.has(c.peer) || !Number.isSafeInteger(time) ||
+      Math.abs(Date.now()+access.clockOffset-time)>35_000 || access.seenMedia.has(seenKey)) {
+    c.close(); return;
+  }
+  if (!access.members.has(c.peer)) await syncRoomAccess(access);
+  if (!roster.has(c.peer) || !await verifyRoomProof(access,'media:'+kind,c.peer,me,nonce,proof,time) ||
+      access.seenMedia.has(seenKey) || !roster.has(c.peer)) {
+    c.close(); return;
+  }
+  const now=Date.now();
+  for(const [seen,until] of access.seenMedia)if(until<=now)access.seenMedia.delete(seen);
+  access.seenMedia.set(seenKey,now+70_000);
+  const k=key(c.peer,kind),old=incoming.get(k);incoming.set(k,c);streams.delete(k);old?.close();c.on('stream',s=>{if(incoming.get(k)!==c)return;streams.set(k,s);if(kind==='screen'&&ui.screen.srcObject!==s)autoplayBlocked=false;renderPeople();renderStage();});const clean=()=>{if(incoming.get(k)===c){incoming.delete(k);streams.delete(k);if(kind==='screen'&&activeScreen===c.peer){screenWaitAt=Date.now();autoplayBlocked=false;}renderPeople();renderStage();}};c.on('close',clean);c.on('error',clean);try{c.answer();watchConnection(c,()=>{clean();c.close();},()=>{});}catch{clean();c.close();}}
 function play(v){try{const promise=v.play();if(promise)promise.then(()=>{if(v===ui.screen){autoplayBlocked=false;updateMediaOverlay();}}).catch(e=>{if(v===ui.screen&&v.srcObject&&e.name==='NotAllowedError'){autoplayBlocked=true;updateMediaOverlay();}});}catch{}}
 function requestScreenRetry(){if(!joined)return;if(activeScreen&&activeScreen!==me){screenRequestAt=Date.now();toHost({type:'mediaRetry'});}else if(activeScreen===me){if(host){for(const participant of clients.keys())if(!tryRoomScreen(participant))retryPeerMedia(participant,'screen');}else republish('screen');}republish('av');requestVoiceRetry();updateMediaOverlay();}
 function updateMediaOverlay(){const remote=joined&&!!activeScreen&&activeScreen!==me;const overlay=$('mediaOverlay'),action=$('mediaOverlayAction'),label=$('mediaOverlayText');if(!remote){overlay.hidden=true;return;}const ready=screenIsPlaying();overlay.hidden=ready&&!autoplayBlocked;if(overlay.hidden)return;if(autoplayBlocked){label.textContent='Video ready. Tap to start playback and sound.';action.textContent='Start playback';}else if(Date.now()-screenWaitAt>26000){label.textContent='Video still hasn’t arrived. Retry, or ask the sender to restart the share.';action.textContent='Retry connection';}else{label.textContent=screenRequestAt?'Trying another connection for shared video…':'Connecting to shared video…';action.textContent='Retry connection';}}
@@ -1271,13 +1598,6 @@ $('movieVolume').oninput = () => {
   if (youtubeSession?.ready) youtubeSession.player.setVolume(volume * 100);
 };
 $('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen?.();else if($('stage').requestFullscreen)$('stage').requestFullscreen().catch(()=>toast('Fullscreen unavailable'));else if(!$('localMovie').hidden)$('localMovie').webkitEnterFullscreen?.();else if(!ui.movie.hidden)ui.movie.webkitEnterFullscreen?.();else if(!ui.screen.hidden)ui.screen.webkitEnterFullscreen?.();};
-$('leave').onclick=()=>{leaving=true;stopShare(false);localAV.getTracks().forEach(t=>t.stop());updateMicMonitor();clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;clearInterval(micMonitorTimer);stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installErev(){if(standalone()){toast('Erev is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Erev.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Erev.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installErev;installHelp.onclick=installErev;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
+$('leave').onclick=()=>{leaving=true;releaseRoomAccess();stopShare(false);localAV.getTracks().forEach(t=>t.stop());updateMicMonitor();clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;releaseRoomAccess();clearInterval(micMonitorTimer);stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installErev(){if(standalone()){toast('Erev is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Erev.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Erev.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installErev;installHelp.onclick=installErev;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
 
-fetch('./api/me').then(response=>response.ok?response.json():null).then(account=>{if(account&&!$('nickname').value)$('nickname').value=account.name.slice(0,28);}).catch(()=>{});
-setInterval(async()=>{
-  if(!joined||leaving)return;
-  try{
-    const response=await fetch('./api/me');
-    if(response.status===401||response.status===403){leaving=true;peer?.destroy();location.replace('/');}
-  }catch{}
-},60_000);
+fetch('./api/me?roomClient=2').then(response=>response.ok?response.json():null).then(account=>{if(account&&!$('nickname').value)$('nickname').value=account.name.slice(0,28);}).catch(()=>{});

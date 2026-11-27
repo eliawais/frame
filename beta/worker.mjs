@@ -3,6 +3,10 @@ const stateCookie = "__Host-erev-oauth";
 const day = 86_400_000;
 const invitePattern = /^(?:[a-z0-9-]{1,24}\.)?(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;
 const opaquePattern = /^[A-Za-z0-9_-]{43}$/;
+const peerPattern = /^erev-beta-v2-[a-f0-9]{32}$/;
+const roomLease = 60_000;
+const activeMembers = "FROM room_members m JOIN sessions s ON s.token_hash=m.session_hash " +
+  "JOIN users u ON u.id=s.user_id WHERE m.room_id=? AND m.expires_at>? AND s.expires_at>? AND u.status='approved'";
 
 function base64url(bytes) {
   return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
@@ -106,7 +110,7 @@ async function currentUser(request, db) {
   const token = readCookie(request, sessionCookie);
   if (!token) return null;
   return db.prepare(
-    "SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ?"
+    "SELECT users.*, sessions.token_hash AS session_hash FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ?"
   ).bind(await digest(token), Date.now()).first();
 }
 
@@ -126,15 +130,21 @@ function adminSignInPage(user, env) {
     intro + action + '<p><a href="/">Back to Erev</a></p>', user ? 403 : 401);
 }
 
-async function googleStart(url, env) {
+async function googleStart(request, url, env) {
   if (!googleConfigured(env)) return signInPage(env);
   const now = Date.now();
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  if (!await takeSendSlot(env.DB, "google-ip:" + await digest(ip), 600_000, 20, now) ||
+      !await takeSendSlot(env.DB, "google-daily", day, 2000, now)) {
+    return page("Try signing in later", '<p>Too many sign-in attempts. <a href="/">Return to Erev</a>.</p>', 429);
+  }
   const state = randomToken();
   const verifier = randomToken();
   const value = url.searchParams.get("invite") || "";
   const adminRequested = url.searchParams.get("next") === "admin";
   const invite = adminRequested ? "/admin" : (invitePattern.test(value) ? value : "");
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM email_rate_limits WHERE expires_at <= ?").bind(now),
     env.DB.prepare("DELETE FROM sign_in_attempts WHERE expires_at <= ?").bind(now),
     env.DB.prepare("INSERT INTO sign_in_attempts (state_hash, verifier, invite, expires_at) VALUES (?, ?, ?, ?)")
       .bind(await digest(state), verifier, invite, now + 600_000),
@@ -400,25 +410,78 @@ async function changeAccess(request, env, admin) {
   return redirect("/admin?done=" + ((await sendApproval(env, userId)) ? "sent" : "unsent"));
 }
 
-async function roomAccess(request, env) {
-  const { action, code } = await request.json();
+async function roomAccess(request, env, user) {
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid room request" }, 400); }
+  const { action, code, peerId, publicKey } = body ?? {};
   if (typeof code !== "string" || !invitePattern.test(code) || code.includes(".")) {
     return json({ error: "Invalid room code" }, 400);
   }
   const now = Date.now();
+  if (action === "sync" || action === "leave") {
+    if (typeof peerId !== "string" || !peerPattern.test(peerId)) return json({ error: "Invalid peer" }, 400);
+    const row = await env.DB.prepare(
+      "SELECT room_id, expires_at FROM room_members WHERE peer_id=? AND session_hash=? AND " +
+      "room_id=(SELECT signaling_code FROM rooms WHERE invite_code=? AND expires_at>?)"
+    ).bind(peerId, user.session_hash, code, now).first();
+    if (!row) return json({ error: "Room membership ended." }, 403);
+    if (action === "leave") {
+      await env.DB.prepare("DELETE FROM room_members WHERE peer_id=? AND session_hash=?").bind(peerId, user.session_hash).run();
+      return json({ left: true });
+    }
+    if (row.expires_at <= now) return json({ error: "Room membership expired." }, 403);
+    const renew = row.expires_at - now <= 45_000;
+    if (renew) {
+      await env.DB.prepare(
+        "UPDATE room_members SET expires_at=? WHERE peer_id=? AND session_hash=? AND expires_at>?"
+      ).bind(now + roomLease, peerId, user.session_hash, now).run();
+    }
+    const members = await env.DB.prepare("SELECT m.peer_id AS peerId, m.public_key AS publicKey, m.is_host AS host " + activeMembers)
+      .bind(row.room_id, now, now).all();
+    if (!members.results.some(member => member.host)) return json({ error: "The host left the room." }, 403);
+    if (!members.results.some(member => member.peerId === peerId)) return json({ error: "Room membership ended." }, 403);
+    return json({ members: members.results, leaseMs: renew ? roomLease : row.expires_at - now, serverTime: now });
+  }
+  if (action !== "create" && action !== "join") return json({ error: "Invalid room action" }, 400);
+  if (typeof publicKey !== "string" || !/^B[A-Za-z0-9_-]{86}$/.test(publicKey)) {
+    return json({ error: "Invalid room identity. Refresh Erev and try again." }, 400);
+  }
+  try {
+    const raw = Uint8Array.from(atob(publicKey.replaceAll("-", "+").replaceAll("_", "/") + "="), c => c.charCodeAt(0));
+    await crypto.subtle.importKey("raw", raw, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  } catch {
+    return json({ error: "Invalid room identity" }, 400);
+  }
+  if (!await takeSendSlot(env.DB, "room:" + user.id, 600_000, 30, now)) {
+    return json({ error: "Too many room requests. Try again shortly." }, 429);
+  }
+  const newPeer = "erev-beta-v2-" + crypto.randomUUID().replaceAll("-", "");
+  await env.DB.prepare("DELETE FROM room_members WHERE expires_at <= ?").bind(now).run();
   if (action === "create") {
     const signalingCode = crypto.randomUUID().replaceAll("-", "");
     await env.DB.batch([
       env.DB.prepare("DELETE FROM rooms WHERE expires_at <= ?").bind(now),
       env.DB.prepare("INSERT OR IGNORE INTO rooms(invite_code, signaling_code, expires_at) VALUES(?, ?, ?)").bind(code, signalingCode, now + 7 * day),
+      env.DB.prepare(
+        "INSERT INTO room_members(peer_id,room_id,session_hash,public_key,is_host,expires_at) " +
+        "SELECT ?,signaling_code,?,?,1,? FROM rooms WHERE invite_code=? AND signaling_code=?"
+      ).bind(newPeer, user.session_hash, publicKey, now + roomLease, code, signalingCode),
     ]);
     const room = await env.DB.prepare("SELECT signaling_code FROM rooms WHERE invite_code=?").bind(code).first();
     if (room?.signaling_code !== signalingCode) return json({ error: "Try creating the room again." }, 409);
-    return json({ signalingCode });
+    return json({ signalingCode, peerId: newPeer, hostPeerId: newPeer, hostKey: publicKey, leaseMs: roomLease, serverTime: now });
   }
-  if (action !== "join") return json({ error: "Invalid room action" }, 400);
-  const room = await env.DB.prepare("SELECT signaling_code FROM rooms WHERE invite_code=? AND expires_at > ?").bind(code, now).first();
-  return room ? json({ signalingCode: room.signaling_code }) : json({ error: "Room not found. Ask the host for a current invite." }, 404);
+  const room = await env.DB.prepare("SELECT signaling_code FROM rooms WHERE invite_code=? AND expires_at>?").bind(code, now).first();
+  if (!room) return json({ error: "Room not found. Ask the host for a current invite." }, 404);
+  const host = await env.DB.prepare("SELECT m.peer_id AS id, m.public_key AS key " + activeMembers + " AND m.is_host=1")
+    .bind(room.signaling_code, now, now).first();
+  if (!host) return json({ error: "The host is offline. Ask for a new room invite." }, 404);
+  const admitted = await env.DB.prepare(
+    "INSERT INTO room_members(peer_id,room_id,session_hash,public_key,is_host,expires_at) " +
+    "SELECT ?,?,?,?,0,? WHERE (SELECT COUNT(*) " + activeMembers + ") < 6 RETURNING peer_id"
+  ).bind(newPeer, room.signaling_code, user.session_hash, publicKey, now + roomLease, room.signaling_code, now, now).first();
+  if (!admitted) return json({ error: "Room is full." }, 409);
+  return json({ signalingCode: room.signaling_code, peerId: newPeer, hostPeerId: host.id, hostKey: host.key, leaseMs: roomLease, serverTime: now });
 }
 
 const browserHelper = "const hash=location.hash.slice(1);const token=document.getElementById('email-token');" +
@@ -455,7 +518,7 @@ export function handler(files) {
           return new Response(method === "HEAD" ? null : asset[1], { headers: headers(asset[0]) });
         }
         if (!env.DB) return page("Erev beta", "<p>Signups are being set up.</p>", 503);
-        if (method === "GET" && path === "/auth/google") return await googleStart(url, env);
+        if (method === "GET" && path === "/auth/google") return await googleStart(request, url, env);
         if (method === "GET" && path === "/auth/google/callback") return await googleCallback(request, url, env);
         if (method === "POST" && path === "/auth/email") return await emailStart(request, env);
         if (path === "/auth/email/verify") {
@@ -484,10 +547,13 @@ export function handler(files) {
         if (path.startsWith("/api/")) {
           if (!user) return json({ error: "Sign in to use Erev." }, 401);
           if (user.status !== "approved") return json({ error: "This account needs approval." }, 403);
-          if (path === "/api/me" && method === "GET") return json({ name: user.name, admin: isAdmin(user, env) });
+          if (path === "/api/me" && method === "GET") {
+            if (url.searchParams.get("roomClient") !== "2") return json({ error: "Refresh Erev to use the current room client." }, 403);
+            return json({ name: user.name, admin: isAdmin(user, env) });
+          }
           if (path === "/api/rooms" && method === "POST") {
             if (!(request.headers.get("Content-Type") || "").startsWith("application/json")) return json({ error: "JSON required" }, 415);
-            return await roomAccess(request, env);
+            return await roomAccess(request, env, user);
           }
           return json({ error: "Not found" }, 404);
         }
@@ -499,7 +565,10 @@ export function handler(files) {
         if (!asset) return json({ error: "Not found" }, 404);
         if (!user || user.status !== "approved") return json({ error: "Forbidden" }, 403);
         const h = headers(asset[0]);
-        if (path === "/" || path === "/index.html") h.set("X-Frame-Options", "DENY");
+        if (path === "/" || path === "/index.html") {
+          h.set("X-Frame-Options", "DENY");
+          h.set("Content-Security-Policy", "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js https://www.youtube.com/iframe_api https://www.youtube.com/s/player/ https://s.ytimg.com/yts/jsbin/; style-src 'self' 'unsafe-inline'; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com https://www.youtube.com https://www.youtube-nocookie.com; img-src 'self' https: data: blob:; media-src 'self' https: blob:; frame-src https:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+        }
         return new Response(method === "HEAD" ? null : asset[1], { headers: h });
       } catch (error) {
         console.error("Erev request failed", { name: error?.name || "Error" });
