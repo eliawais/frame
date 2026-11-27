@@ -28,9 +28,41 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
-      - run: gradle -p android assembleDebug --no-daemon
+      - run: gradle -p android assembleDebug assembleDebugAndroidTest --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: erev-android-beta
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+      - name: Test microphone capture and audio delivery on Android
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          runner_sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          sudo chmod a+rw /dev/kvm
+          system_image="system-images;android-35;google_apis;x86_64"
+          sdkmanager "$system_image"
+          printf 'no\n' | avdmanager create avd --force --name erev-mic --package "$system_image"
+          "$runner_sdk/emulator/emulator" -avd erev-mic -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect > /tmp/erev-emulator.log 2>&1 &
+          booted=
+          for attempt in {1..90}; do
+            if [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]]; then
+              booted=yes
+              break
+            fi
+            sleep 3
+          done
+          if [[ "$booted" != yes ]]; then
+            cat /tmp/erev-emulator.log
+            exit 1
+          fi
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard
+          adb install -g android/app/build/outputs/apk/debug/app-debug.apk
+          adb install android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          result=$(adb shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
+          echo "$result"
+          if ! grep -q 'result=mic-and-rtp-ok' <<< "$result"; then
+            adb logcat -d -s chromium AndroidRuntime AudioManagerAndroid
+            exit 1
+          fi
