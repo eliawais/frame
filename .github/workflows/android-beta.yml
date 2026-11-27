@@ -39,6 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           runner_sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          sdk_adb="$runner_sdk/platform-tools/adb"
+          "$sdk_adb" start-server
           sudo chmod a+rw /dev/kvm
           export ANDROID_USER_HOME="$RUNNER_TEMP/erev-android-user"
           export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
@@ -54,8 +56,8 @@ jobs:
           "$runner_sdk/emulator/emulator" -avd erev-mic -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect > /tmp/erev-emulator.log 2>&1 &
           emulator_pid=$!
           booted=
-          for attempt in {1..90}; do
-            if [[ "$(timeout 4 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]]; then
+          for attempt in {1..36}; do
+            if [[ "$(timeout 6 "$sdk_adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]]; then
               booted=yes
               break
             fi
@@ -63,16 +65,17 @@ jobs:
             sleep 3
           done
           if [[ "$booted" != yes ]]; then
+            "$sdk_adb" devices -l
             cat /tmp/erev-emulator.log
             exit 1
           fi
-          adb shell input keyevent KEYCODE_WAKEUP
-          adb shell wm dismiss-keyguard
-          adb install -g android/app/build/outputs/apk/debug/app-debug.apk
-          adb install android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          result=$(timeout 80 adb shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
+          "$sdk_adb" shell input keyevent KEYCODE_WAKEUP
+          "$sdk_adb" shell wm dismiss-keyguard
+          "$sdk_adb" install -g android/app/build/outputs/apk/debug/app-debug.apk
+          "$sdk_adb" install android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          result=$(timeout 80 "$sdk_adb" shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
           echo "$result"
           if ! grep -q 'result=mic-and-rtp-ok' <<< "$result"; then
-            adb logcat -d -s chromium AndroidRuntime AudioManagerAndroid
+            "$sdk_adb" logcat -d -s chromium AndroidRuntime AudioManagerAndroid
             exit 1
           fi
