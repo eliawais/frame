@@ -40,20 +40,26 @@ jobs:
           set -euo pipefail
           runner_sdk="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           sudo chmod a+rw /dev/kvm
+          export ANDROID_USER_HOME="$RUNNER_TEMP/erev-android-user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           system_image="system-images;android-35;google_apis;x86_64"
           sdk_tools="$runner_sdk/cmdline-tools/latest/bin"
           if [[ ! -x "$sdk_tools/sdkmanager" ]]; then
             sdk_tools="$(dirname "$(find "$runner_sdk/cmdline-tools" -name sdkmanager | sort -V | tail -1)")"
           fi
           "$sdk_tools/sdkmanager" "$system_image"
-          printf 'no\n' | "$sdk_tools/avdmanager" create avd --force --name erev-mic --package "$system_image"
+          printf 'no\n' | "$sdk_tools/avdmanager" create avd --force --name erev-mic --package "$system_image" --path "$ANDROID_AVD_HOME/erev-mic.avd"
+          "$runner_sdk/emulator/emulator" -list-avds | grep -Fx erev-mic
           "$runner_sdk/emulator/emulator" -avd erev-mic -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect > /tmp/erev-emulator.log 2>&1 &
+          emulator_pid=$!
           booted=
           for attempt in {1..90}; do
-            if [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]]; then
+            if [[ "$(timeout 4 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]]; then
               booted=yes
               break
             fi
+            kill -0 "$emulator_pid" 2>/dev/null || break
             sleep 3
           done
           if [[ "$booted" != yes ]]; then
@@ -64,7 +70,7 @@ jobs:
           adb shell wm dismiss-keyguard
           adb install -g android/app/build/outputs/apk/debug/app-debug.apk
           adb install android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          result=$(adb shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
+          result=$(timeout 80 adb shell am instrument -w app.erev.mobile.test/app.erev.mobile.MicSmoke)
           echo "$result"
           if ! grep -q 'result=mic-and-rtp-ok' <<< "$result"; then
             adb logcat -d -s chromium AndroidRuntime AudioManagerAndroid
