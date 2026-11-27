@@ -1,5 +1,6 @@
 const sessionCookie = "__Host-erev-session";
 const stateCookie = "__Host-erev-oauth";
+const androidCookie = "__Host-erev-android";
 const day = 86_400_000;
 const invitePattern = /^(?:[a-z0-9-]{1,24}\.)?(?:[a-f0-9]{32}|[0-9a-hjkmnp-tv-z]{16})$/;
 const opaquePattern = /^[A-Za-z0-9_-]{43}$/;
@@ -142,7 +143,9 @@ async function googleStart(request, url, env) {
   const verifier = randomToken();
   const value = url.searchParams.get("invite") || "";
   const adminRequested = url.searchParams.get("next") === "admin";
-  const invite = adminRequested ? "/admin" : (invitePattern.test(value) ? value : "");
+  const deviceChallenge = url.searchParams.get("android") || "";
+  const invite = opaquePattern.test(deviceChallenge) ? "android:" + deviceChallenge :
+    adminRequested ? "/admin" : (invitePattern.test(value) ? value : "");
   await env.DB.batch([
     env.DB.prepare("DELETE FROM email_rate_limits WHERE expires_at <= ?").bind(now),
     env.DB.prepare("DELETE FROM sign_in_attempts WHERE expires_at <= ?").bind(now),
@@ -215,8 +218,61 @@ async function startSession(env, { id, email, label, admin, invite }, cookies = 
     env.DB.prepare("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
       .bind(await digest(session), id, now + 7 * day),
   ]);
-  const destination = invite === "/admin" ? "/admin" : "/" + (invite ? "#" + invite : "");
+  const androidChallenge = invite.startsWith("android:") ? invite.slice(8) : "";
+  const destination = opaquePattern.test(androidChallenge) ? "/auth/android?challenge=" + androidChallenge :
+    invite === "/admin" ? "/admin" : "/" + (invite ? "#" + invite : "");
   return redirect(destination, [...cookies, cookie(sessionCookie, session, 7 * 86400)]);
+}
+
+async function androidLink(request, url, env, user) {
+  const challenge = request.method === "POST" ? (await request.formData()).get("challenge") : url.searchParams.get("challenge");
+  if (typeof challenge !== "string" || !opaquePattern.test(challenge)) {
+    return page("Android sign-in expired", "<p>Start again from the Erev Android app.</p>", 400);
+  }
+  if (!user) return page("Connect Erev for Android", '<p>Sign in to connect your account to the Android app.</p>' +
+    '<a class="button" href="/auth/google?android=' + challenge + '">Continue with Google</a>');
+  if (request.method === "GET") {
+    return page("Connect Erev for Android", "<p>Continue as " + escape(user.email) + ".</p>" +
+      '<form action="/auth/android" method="post"><input type="hidden" name="challenge" value="' + challenge +
+      '"><button>Connect my account</button></form>');
+  }
+  const now = Date.now();
+  if (!await takeSendSlot(env.DB, "android:" + user.id, 600_000, 10, now)) {
+    return page("Try again later", "<p>Too many Android sign-in attempts. Start a new sign-in in a few minutes.</p>", 429);
+  }
+  const code = randomToken();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM android_handoffs WHERE expires_at<=?").bind(now),
+    env.DB.prepare("INSERT INTO android_handoffs(code_hash,challenge,session_hash,expires_at) VALUES(?,?,?,?)")
+      .bind(await digest(code), challenge, user.session_hash, now + 120_000),
+  ]);
+  return page("Return to Erev", '<p>Open the app to finish signing in.</p><a class="button" href="intent://login?code=' +
+    code + '#Intent;scheme=erev-android;package=app.erev.mobile;end">Open Erev for Android</a>');
+}
+
+function androidFinish() {
+  return page("Connecting your account", '<p>Returning to Erev for Android.</p>' +
+    '<form action="/auth/android/exchange" method="post" id="android-exchange">' +
+    '<input type="hidden" id="android-code" name="code"></form>' + browserScript);
+}
+
+async function androidExchange(request, env) {
+  const verifier = readCookie(request, androidCookie);
+  const code = (await request.formData()).get("code");
+  const expired = () => page("Android sign-in expired", "<p>Start again from the Erev Android app.</p>", 400);
+  if (!verifier || typeof code !== "string" || !opaquePattern.test(code)) return expired();
+  const now = Date.now();
+  const handoff = await env.DB.prepare(
+    "DELETE FROM android_handoffs WHERE code_hash=? AND challenge=? AND expires_at>? RETURNING session_hash"
+  ).bind(await digest(code), await digest(verifier), now).first();
+  if (!handoff) return expired();
+  const source = await env.DB.prepare("SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>?")
+    .bind(handoff.session_hash, now).first();
+  if (!source) return expired();
+  const token = randomToken();
+  await env.DB.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)")
+    .bind(await digest(token), source.user_id, now + 7 * day).run();
+  return redirect("/", [cookie(androidCookie, "", 0), cookie(sessionCookie, token, 7 * 86400)]);
 }
 
 async function sendEmail(env, { to, subject, text, key }) {
@@ -485,7 +541,9 @@ async function roomAccess(request, env, user) {
 }
 
 const browserHelper = "const hash=location.hash.slice(1);const token=document.getElementById('email-token');" +
-  "if(token){if(/^[A-Za-z0-9_-]{43}$/.test(hash)){token.value=hash;document.getElementById('verify-email').disabled=false;}" +
+  "const android=document.getElementById('android-code');" +
+  "if(android){if(/^[A-Za-z0-9_-]{43}$/.test(hash)){android.value=hash;history.replaceState(null,'',location.pathname);document.getElementById('android-exchange').requestSubmit();}}" +
+  "else if(token){if(/^[A-Za-z0-9_-]{43}$/.test(hash)){token.value=hash;document.getElementById('verify-email').disabled=false;}" +
   "if(hash)history.replaceState(null,'',location.pathname);}" +
   "else{const invite=hash||new URL(location.href).searchParams.get('room');const field=document.getElementById('email-invite');" +
   "const link=document.getElementById('google-sign-in');if(invite){if(field)field.value=invite;if(link)link.search=new URLSearchParams({invite});}}" +
@@ -530,7 +588,10 @@ export function handler(files) {
           if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await digest(token)).run();
           return redirect("/", [cookie(sessionCookie, "", 0)]);
         }
+        if (path === "/auth/android/finish" && method === "GET") return androidFinish();
+        if (path === "/auth/android/exchange" && method === "POST") return await androidExchange(request, env);
         const user = await currentUser(request, env.DB);
+        if (path === "/auth/android" && (method === "GET" || method === "POST")) return await androidLink(request, url, env, user);
         if (path === "/account" && method === "GET") {
           if (!user) return redirect("/");
           return page("Your account", "<p>Signed in as " + escape(user.email) + '.</p><p><a href="/">Open Erev</a>' +

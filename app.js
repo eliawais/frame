@@ -1106,7 +1106,68 @@ const handheldShare = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const appleHandheld = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const displayCaptureAvailable = () => typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+
+const androidBridge = window.ErevAndroid;
+const androidCaptureAvailable = () => typeof androidBridge?.postMessage === 'function' &&
+  typeof HTMLCanvasElement.prototype.captureStream === 'function';
+let androidShare = null;
+
+function stopAndroidCapture() {
+  if (!androidShare) return;
+  const capture = androidShare;
+  androidShare = null;
+  clearTimeout(capture.timeout);
+  androidBridge.onmessage = null;
+  androidBridge.postMessage(JSON.stringify({action:'stop', id:capture.id}));
+  if (!capture.stream) capture.reject(new DOMException('Screen sharing ended.', 'NotAllowedError'));
+}
+
+function captureAndroidScreen() {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d', {alpha:false});
+    if (!context) { reject(new Error('Screen canvas unavailable.')); return; }
+    const capture = {id:id(), reject, stream:null, timeout:setTimeout(stopAndroidCapture, 90_000)};
+    androidShare = capture;
+    androidBridge.onmessage = ({data}) => {
+      let message;
+      try { message = JSON.parse(data); } catch { return; }
+      if (message.id !== capture.id || androidShare !== capture) return;
+      if (message.kind === 'ended') {
+        if (capture.stream) stopShare();
+        else {
+          stopAndroidCapture();
+        }
+        return;
+      }
+      if (message.kind !== 'frame' || typeof message.jpeg !== 'string') return;
+      const frame = new Image();
+      const next = () => androidBridge.postMessage(JSON.stringify({action:'next', id:capture.id}));
+      frame.onerror = () => { if (androidShare === capture) next(); };
+      frame.onload = () => {
+        if (androidShare !== capture) return;
+        try {
+          if (canvas.width !== frame.width) canvas.width = frame.width;
+          if (canvas.height !== frame.height) canvas.height = frame.height;
+          context.drawImage(frame, 0, 0);
+          if (!capture.stream) {
+            capture.stream = canvas.captureStream();
+            clearTimeout(capture.timeout);
+            resolve(capture.stream);
+          }
+          next();
+        } catch {
+          if (capture.stream) stopShare();
+          else stopAndroidCapture();
+        }
+      };
+      frame.src = 'data:image/jpeg;base64,' + message.jpeg;
+    };
+    androidBridge.postMessage(JSON.stringify({action:'start', id:capture.id}));
+  });
+}
+
+const displayCaptureAvailable = () => androidCaptureAvailable() || typeof navigator.mediaDevices?.getDisplayMedia === 'function';
 const screenShareSupport = $('screenShareSupport');
 
 function screenShareHelp() {
@@ -1152,10 +1213,11 @@ async function share(preferTab = false) {
     selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'exclude', surfaceSwitching: 'include'
   } : {video, audio: true};
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia(options);
+    const stream = androidCaptureAvailable() ? await captureAndroidScreen() : await navigator.mediaDevices.getDisplayMedia(options);
     const track = stream.getVideoTracks()[0];
     if (!track || leaving || !joined || (!host && !up?.open) || activeScreen || localScreen || pendingLocal) {
       stream.getTracks().forEach(item => item.stop());
+      stopAndroidCapture();
       if (!leaving) toast('The room or share changed while the picker was open.');
       return;
     }
@@ -1179,7 +1241,7 @@ async function share(preferTab = false) {
     choosingShare = false;
   }
 }
-function stopShare(notify=true){const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;localSeekId='';if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');setScreenShareControls(false);if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
+function stopShare(notify=true){stopAndroidCapture();const s=localScreen;localScreen=null;const wasLocal=localPlayback||pendingLocal;localPlayback=false;pendingLocal=false;localSeekId='';if(s)s.getTracks().forEach(t=>{t.onended=null;t.stop();});if(wasLocal){const v=$('localMovie');v.pause();v.removeAttribute('src');v.load();if(localURL){URL.revokeObjectURL(localURL);localURL='';}$('localLabel').textContent='Local video';$('localLabel').setAttribute('aria-pressed','false');}republish('screen');setScreenShareControls(false);if(notify&&s)toHost({type:'share',on:false});renderStage();}$('share').onclick=()=>share();$('emptyShare').onclick=()=>share();
 function renderStage(){const ownLocal=(localPlayback||pendingLocal)&&(!activeScreen||activeScreen===me);const s=currentScreenStream();const sharing=!!activeScreen||ownLocal;const browsing=!sharing&&!!browserState;const youtube=!sharing&&!browsing&&isYouTubeMovie();$('browserStage').hidden=!browsing;updateYouTubeStage(youtube);$('localMovie').hidden=!ownLocal;ui.screen.hidden=ownLocal||!sharing||!s;ui.movie.hidden=sharing||browsing||!movieState||youtube;$('empty').hidden=ownLocal||browsing||(sharing&&!!s)||(!sharing&&!!movieState);const displayStream=ownLocal?null:s||null;if(ui.screen.srcObject!==displayStream){autoplayBlocked=false;ui.screen.srcObject=displayStream;ui.screen.muted=activeScreen===me;if(displayStream){ui.screen.playsInline=true;ui.screen.autoplay=true;play(ui.screen);}}if(sharing&&!s&&!ownLocal){$('empty').querySelector('h2').textContent='Connecting to shared screen…';}else $('empty').querySelector('h2').textContent='Make it movie night.';if((sharing||browsing)&&!ui.movie.paused)ui.movie.pause();refreshAccess();updateMediaOverlay();}
 
 function chooseLocal(){if(!joined)return;if(localPlayback||pendingLocal){stopShare();return;}if(localScreen||activeScreen){toast('Stop the current share first.');return;}$('localFile').click();}
@@ -1634,6 +1696,6 @@ $('movieVolume').oninput = () => {
   if (youtubeSession?.ready) youtubeSession.player.setVolume(volume * 100);
 };
 $('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen?.();else if($('stage').requestFullscreen)$('stage').requestFullscreen().catch(()=>toast('Fullscreen unavailable'));else if(!$('localMovie').hidden)$('localMovie').webkitEnterFullscreen?.();else if(!ui.movie.hidden)ui.movie.webkitEnterFullscreen?.();else if(!ui.screen.hidden)ui.screen.webkitEnterFullscreen?.();};
-$('leave').onclick=()=>{leaving=true;releaseRoomAccess();stopShare(false);localAV.getTracks().forEach(t=>t.stop());updateMicMonitor();clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;releaseRoomAccess();clearInterval(micMonitorTimer);stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installErev(){if(standalone()){toast('Erev is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Erev.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Erev.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installErev;installHelp.onclick=installErev;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
+$('leave').onclick=()=>{leaving=true;releaseRoomAccess();stopShare(false);localAV.getTracks().forEach(t=>t.stop());updateMicMonitor();clearInterval(networkWatch);stopVoiceCapture();clearVoicePlayback();peer?.destroy();location.href=new URL('./',location.href).href;};window.addEventListener('pagehide',()=>{leaving=true;stopAndroidCapture();releaseRoomAccess();clearInterval(micMonitorTimer);stopVoiceCapture();clearVoicePlayback();if(voiceContext?.state!=='closed')voiceContext?.close().catch(()=>{});localScreen?.getTracks().forEach(t=>t.stop());localAV.getTracks().forEach(t=>t.stop());peer?.destroy();});document.addEventListener('pointerdown',()=>{for(const v of document.querySelectorAll('video'))if(v.srcObject&&v.paused)play(v);});let installPrompt=null;const installButton=$('install'),installHelp=$('installHelp');const standalone=()=>matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;async function installErev(){if(standalone()){toast('Erev is already installed.');return;}if(!installPrompt){toast(/Android/i.test(navigator.userAgent)?'Chrome menu ⋮ → Install app or Add to Home screen.':'Use Chrome or Edge browser menu to install Erev.');return;}try{const p=installPrompt;installPrompt=null;await p.prompt();const result=await p.userChoice;if(result.outcome==='accepted')installButton.hidden=true;}catch{toast('Use the browser menu to install Erev.');}}window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installPrompt=e;installButton.hidden=false;});window.addEventListener('appinstalled',()=>{installButton.hidden=true;installHelp.hidden=true;installPrompt=null;});installButton.onclick=installErev;installHelp.onclick=installErev;installButton.hidden=standalone();installHelp.hidden=standalone();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).catch(()=>{});
 
 fetch('./api/me?roomClient=2').then(response=>response.ok?response.json():null).then(account=>{if(account&&!$('nickname').value)$('nickname').value=account.name.slice(0,28);}).catch(()=>{});
